@@ -23,18 +23,21 @@ target_compile_options(gpu_float_compress PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   #--device-debug
 >)
 
-enable_testing()
-include(GoogleTest)
-
-add_executable(float_test FloatTest.cu)
-target_link_libraries(float_test
-  gpu_float_compress
-  gtest_main
-)
-gtest_discover_tests(float_test)
-
-
 get_property(GLOBAL_CUDA_ARCHITECTURES GLOBAL PROPERTY CUDA_ARCHITECTURES)
-set_target_properties(gpu_float_compress float_test PROPERTIES
+set_target_properties(gpu_float_compress PROPERTIES
   CUDA_ARCHITECTURES "${GLOBAL_CUDA_ARCHITECTURES}"
+  LINKER_LANGUAGE CXX
 )
+
+if(DIETGPU_BUILD_TESTS)
+  add_executable(float_test FloatTest.cu)
+  target_link_libraries(float_test
+    gpu_float_compress
+    gtest_main
+  )
+  gtest_discover_tests(float_test)
+  set_target_properties(float_test PROPERTIES
+    CUDA_ARCHITECTURES "${GLOBAL_CUDA_ARCHITECTURES}"
+    LINKER_LANGUAGE CXX
+  )
+endif()

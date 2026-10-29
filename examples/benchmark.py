@@ -1,4 +1,5 @@
-# Copyright (c) (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2026 Yee Hin Chong (yuxuan-z) — modifications to the original work
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -9,46 +10,41 @@
 
 import torch
 
-torch.ops.load_library("//dietgpu:dietgpu")
+import dietgpu
+
 dev = torch.device("cuda:0")
 
 
-def calc_comp_ratio(input_ts, out_sizes):
+def calc_comp_ratio(input_ts: list[torch.Tensor], out_sizes: torch.Tensor):
     total_input_size = 0
     total_comp_size = 0
 
-    for t, s in zip(input_ts, out_sizes):
+    for t, s in zip(input_ts, out_sizes, strict=True):
         total_input_size += t.numel() * t.element_size()
         total_comp_size += s
 
     return total_input_size, total_comp_size, total_comp_size / total_input_size
 
 
-def get_float_comp_timings(ts, num_runs=3):
+def get_float_comp_timings(ts: list[torch.Tensor], num_runs: int = 3):
     tempMem = torch.empty([384 * 1024 * 1024], dtype=torch.uint8, device=dev)
 
     comp_time = 0
     decomp_time = 0
-    total_size = 0
-    comp_size = 0
 
     # ignore first run timings
     for i in range(1 + num_runs):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        rows, cols = torch.ops.dietgpu.max_float_compressed_output_size(ts)
+        rows, cols = dietgpu.max_float_compressed_output_size(ts)
 
         comp = torch.empty([rows, cols], dtype=torch.uint8, device=dev)
         sizes = torch.zeros([len(ts)], dtype=torch.int, device=dev)
 
         start.record()
-        comp, sizes, memUsed = torch.ops.dietgpu.compress_data(
-            True, ts, tempMem, comp, sizes
-        )
+        comp, sizes, _ = dietgpu.compress_data(True, ts, False, tempMem, comp, sizes)
         end.record()
-
-        comp_size = 0
 
         torch.cuda.synchronize()
         if i > 0:
@@ -70,8 +66,8 @@ def get_float_comp_timings(ts, num_runs=3):
         end = torch.cuda.Event(enable_timing=True)
 
         start.record()
-        torch.ops.dietgpu.decompress_data(
-            True, comp_ts, out_ts, tempMem, out_status, out_sizes
+        dietgpu.decompress_data(
+            True, comp_ts, out_ts, False, tempMem, out_status, out_sizes
         )
         end.record()
 
@@ -94,23 +90,19 @@ def get_any_comp_timings(ts, num_runs=3):
 
     comp_time = 0
     decomp_time = 0
-    total_size = 0
-    comp_size = 0
 
     # ignore first run timings
     for _ in range(1 + num_runs):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        rows, cols = torch.ops.dietgpu.max_any_compressed_output_size(ts)
+        rows, cols = dietgpu.max_any_compressed_output_size(ts)
 
         comp = torch.empty([rows, cols], dtype=torch.uint8, device=dev)
         sizes = torch.zeros([len(ts)], dtype=torch.int, device=dev)
 
         start.record()
-        comp, sizes, memUsed = torch.ops.dietgpu.compress_data(
-            False, ts, tempMem, comp, sizes
-        )
+        comp, sizes, _ = dietgpu.compress_data(False, ts, False, tempMem, comp, sizes)
         end.record()
 
         torch.cuda.synchronize()
@@ -132,8 +124,8 @@ def get_any_comp_timings(ts, num_runs=3):
         end = torch.cuda.Event(enable_timing=True)
 
         start.record()
-        torch.ops.dietgpu.decompress_data(
-            False, comp_ts, out_ts, tempMem, out_status, out_sizes
+        dietgpu.decompress_data(
+            False, comp_ts, out_ts, False, tempMem, out_status, out_sizes
         )
         end.record()
 
@@ -158,9 +150,7 @@ for dt in [torch.bfloat16, torch.float16, torch.float32]:
 
     print(f"Float codec non-batched perf [128 * 512 * 1024] {dt}")
     print(
-        "comp   time {:.3f} ms B/W {:.1f} GB/s, compression {} -> {} bytes ({:.4f}x) ".format(
-            c, c_bw, total_size, comp_size, ratio
-        )
+        f"comp   time {c:.3f} ms B/W {c_bw:.1f} GB/s, compression {total_size} -> {comp_size} bytes ({ratio:.4f}x) "
     )
     print(f"decomp time {dc:.3f} ms B/W {dc_bw:.1f} GB/s")
 
@@ -171,14 +161,12 @@ for dt in [torch.bfloat16, torch.float16, torch.float32]:
 
     c, dc, total_size, comp_size = get_float_comp_timings(ts)
     ratio = comp_size / total_size
-    bw = (total_size / 1e9) / (c * 1e-3)
+    c_bw = (total_size / 1e9) / (c * 1e-3)
     dc_bw = (total_size / 1e9) / (dc * 1e-3)
 
     print(f"Float codec batched perf [128, [512 * 1024]] {dt}")
     print(
-        "comp   time {:.3f} ms B/W {:.1f} GB/s, compression {} -> {} bytes ({:.4f}x) ".format(
-            c, c_bw, total_size, comp_size, ratio
-        )
+        f"comp   time {c:.3f} ms B/W {c_bw:.1f} GB/s, compression {total_size} -> {comp_size} bytes ({ratio:.4f}x) "
     )
     print(f"decomp time {dc:.3f} ms B/W {dc_bw:.1f} GB/s")
 
@@ -196,9 +184,7 @@ for dt in [torch.bfloat16, torch.float16, torch.float32]:
 
     print(f"Raw ANS byte-wise non-batched perf [128 * 512 * 1024] {dt}")
     print(
-        "comp   time {:.3f} ms B/W {:.1f} GB/s, compression {} -> {} bytes ({:.4f}x) ".format(
-            c, c_bw, total_size, comp_size, ratio
-        )
+        f"comp   time {c:.3f} ms B/W {c_bw:.1f} GB/s, compression {total_size} -> {comp_size} bytes ({ratio:.4f}x) "
     )
     print(f"decomp time {dc:.3f} ms B/W {dc_bw:.1f} GB/s")
 
@@ -214,8 +200,6 @@ for dt in [torch.bfloat16, torch.float16, torch.float32]:
 
     print(f"Raw ANS byte-wise batched perf [128, [512 * 1024]] {dt}")
     print(
-        "comp   time {:.3f} ms B/W {:.1f} GB/s, compression {} -> {} bytes ({:.4f}x) ".format(
-            c, c_bw, total_size, comp_size, ratio
-        )
+        f"comp   time {c:.3f} ms B/W {c_bw:.1f} GB/s, compression {total_size} -> {comp_size} bytes ({ratio:.4f}x) "
     )
     print(f"decomp time {dc:.3f} ms B/W {dc_bw:.1f} GB/s")

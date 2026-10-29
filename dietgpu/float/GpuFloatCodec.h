@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cuda.h>
+
 #include "dietgpu/ans/GpuANSCodec.h"
 
 namespace dietgpu {
@@ -16,10 +17,10 @@ class StackDeviceMemory;
 
 // The various floating point types we support for compression
 enum class FloatType : uint32_t {
-  kUndefined = 0,
-  kFloat16 = 1,
-  kBFloat16 = 2,
-  kFloat32 = 3,
+    kUndefined = 0,
+    kFloat16 = 1,
+    kBFloat16 = 2,
+    kFloat32 = 3
 };
 
 // Returns the maximum possible compressed size in bytes of an array of `size`
@@ -31,49 +32,46 @@ enum class FloatType : uint32_t {
 uint32_t getMaxFloatCompressedSize(FloatType floatType, uint32_t size);
 
 struct FloatCodecConfig {
-  inline FloatCodecConfig()
-      : floatType(FloatType::kFloat16),
-        useChecksum(false),
-        is16ByteAligned(false) {}
+    inline FloatCodecConfig()
+        : floatType(FloatType::kFloat16),
+          useChecksum(false),
+          is16ByteAligned(false) {}
 
-  inline FloatCodecConfig(
-      FloatType ft,
-      const ANSCodecConfig& ansConf,
-      bool align,
-      bool checksum = false)
-      : floatType(ft),
-        useChecksum(checksum),
-        ansConfig(ansConf),
-        is16ByteAligned(align) {
-    // ANS-level checksumming is not allowed in float mode, only float level
-    // checksumming
-    assert(!ansConf.useChecksum);
-  }
+    inline FloatCodecConfig(FloatType ft, const ANSCodecConfig& ansConf,
+                            bool align, bool checksum = false)
+        : floatType(ft),
+          useChecksum(checksum),
+          ansConfig(ansConf),
+          is16ByteAligned(align) {
+        // ANS-level checksumming is not allowed in float mode, only float level
+        // checksumming
+        assert(!ansConf.useChecksum);
+    }
 
-  // What kind of floats are we compressing/decompressing?
-  FloatType floatType;
+    // What kind of floats are we compressing/decompressing?
+    FloatType floatType;
 
-  // If true, we calculate a checksum on the uncompressed float input data to
-  // compression and store it in the archive, and on the decompression side
-  // post-decompression, we calculate a checksum on the decompressed data which
-  // is compared with the original stored in the archive.
-  // This is an optional feature useful if DietGPU data will be stored
-  // persistently on disk.
-  bool useChecksum;
+    // If true, we calculate a checksum on the uncompressed float input data to
+    // compression and store it in the archive, and on the decompression side
+    // post-decompression, we calculate a checksum on the decompressed data
+    // which is compared with the original stored in the archive. This is an
+    // optional feature useful if DietGPU data will be stored persistently on
+    // disk.
+    bool useChecksum;
 
-  // ANS entropy coder parameters
-  // Checksumming will happen at the float level, not the ANS level, as
-  // decompression from ANS is immediately consumed by the float layer,
-  // so ansConfig.useChecksum being true is an error.
-  ANSCodecConfig ansConfig;
+    // ANS entropy coder parameters
+    // Checksumming will happen at the float level, not the ANS level, as
+    // decompression from ANS is immediately consumed by the float layer,
+    // so ansConfig.useChecksum being true is an error.
+    ANSCodecConfig ansConfig;
 
-  // Are all all float input pointers/offsets (compress) or output
-  // pointers/offsets (decompress) are aligned to 16 bytes?
-  //
-  // If so, we can accelerate the decompression. If not, the float addresses
-  // should be aligned to the floating point word size (e.g.,
-  // FloatType::kFloat16, all are assumed sizeof(float16) == 2 byte aligned)
-  bool is16ByteAligned;
+    // Are all all float input pointers/offsets (compress) or output
+    // pointers/offsets (decompress) are aligned to 16 bytes?
+    //
+    // If so, we can accelerate the decompression. If not, the float addresses
+    // should be aligned to the floating point word size (e.g.,
+    // FloatType::kFloat16, all are assumed sizeof(float16) == 2 byte aligned)
+    bool is16ByteAligned;
 };
 
 // Same config options for compression and decompression for now
@@ -81,19 +79,19 @@ using FloatCompressConfig = FloatCodecConfig;
 using FloatDecompressConfig = FloatCodecConfig;
 
 enum class FloatDecompressError : uint32_t {
-  None = 0,
-  ChecksumMismatch = 1,
+    None = 0,
+    ChecksumMismatch = 1,
 };
 
 // Error status for decompression
 struct FloatDecompressStatus {
-  inline FloatDecompressStatus() : error(FloatDecompressError::None) {}
+    inline FloatDecompressStatus() : error(FloatDecompressError::None) {}
 
-  // Overall error status
-  FloatDecompressError error;
+    // Overall error status
+    FloatDecompressError error;
 
-  // Error-specific information for the batch
-  std::vector<std::pair<int, std::string>> errorInfo;
+    // Error-specific information for the batch
+    std::vector<std::pair<int, std::string>> errorInfo;
 };
 
 //
@@ -291,4 +289,4 @@ void floatGetCompressedInfoDevice(
     // stream on the current device on which this runs
     cudaStream_t stream);
 
-} // namespace dietgpu
+}  // namespace dietgpu

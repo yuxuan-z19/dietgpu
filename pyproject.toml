@@ -1,0 +1,110 @@
+[build-system]
+# torch is deliberately NOT a build requirement: PEP 517 isolation would
+# install a throwaway torch, producing a binary that links the wrong libtorch
+# and dies on import with "undefined symbol". Build isolation is disabled via
+# [tool.uv] below; the toolchain lives in [project].dependencies instead.
+#
+# Floor is 1.0: cmake.version as a specifier set (">=3.18,<4") requires
+# scikit-build-core >= 0.8; earlier versions use the deprecated
+# cmake.minimum-version key and silently ignore this setting.
+requires = ["scikit-build-core>=1.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "dietgpu"
+version = "0.1.0"
+description = "Open-source GPU compression for PyTorch. ANS entropy coding for fp16/bf16/fp32 on CUDA-compatible devices. Free alternative to proprietary nvCOMP."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Jeff Johnson (original author)", email = "jhj@fb.com" },
+    { name = "Yee Hin Chong (fork maintainer)", email = "yuxuan-z19@qq.com" },
+]
+keywords = [
+    "pytorch",
+    "compression",
+    "gpu",
+    "cuda",
+    "ans",
+    "float",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Archiving :: Compression",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+]
+dependencies = [
+    "torch",
+    "scikit-build-core>=1.0",
+    # cmake<4 cap: CMake 4.x rejects cmake_policy(VERSION 3.3) in
+    # third_party/glog. Keep in sync with cmake.version below.
+    "cmake>=3.18,<4",
+    "ninja>=1.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "build>=1.6.1",
+    "twine>=7.0.0",
+    "pre-commit>=4.7.0",
+]
+
+[project.urls]
+Repository = "https://github.com/yuxuan-z19/dietgpu"
+Issues = "https://github.com/yuxuan-z19/dietgpu/issues"
+Documentation = "https://github.com/yuxuan-z19/dietgpu#readme"
+
+# Lets `uv pip install -e .` run without --no-build-isolation.
+# pip users must still pass --no-build-isolation explicitly.
+[tool.uv]
+no-build-isolation-package = ["dietgpu"]
+
+[tool.scikit-build]
+# 3.18 introduced CMAKE_CUDA_ARCHITECTURES; deliberately NOT mirrored by
+# cmake_minimum_required in CMakeLists.txt (see comment there on CMP0104).
+# The <4 cap must be repeated here because this covers the path where
+# scikit-build-core provisions cmake for an isolated build on a machine
+# without a system cmake. Keep in sync with [project].dependencies.
+cmake.version = ">=3.18,<4"
+cmake.build-type = "Release"
+wheel.packages = ["dietgpu"]
+build-dir = "build/{wheel_tag}"
+
+# Only take install rules tagged COMPONENT python into the wheel.
+# Without this, googletest/glog artifacts leak into site-packages root.
+install.components = ["python"]
+
+[tool.scikit-build.cmake.define]
+# CMake does NOT seed CMAKE_PREFIX_PATH from the env var of the same name.
+# This pass-through lets an explicit torch path win over auto-detection.
+CMAKE_PREFIX_PATH = { env = "CMAKE_PREFIX_PATH", default = "" }
+
+# Escape hatch for target GPU architectures (e.g. "89" or "70;80;89").
+# Needed for GPU-less CI, cross-compilation, and non-NVIDIA accelerators.
+# No `default` key: `default = ""` would pass an empty -DCMAKE_CUDA_ARCHITECTURES=
+# which CMake rejects outright.
+CMAKE_CUDA_ARCHITECTURES = { env = "DIETGPU_CUDA_ARCHITECTURES" }
+
+# find_package(Torch) appends its own -gencode flags driven by
+# TORCH_CUDA_ARCH_LIST (dotted form: "8.9", "8.0;8.9", "all").
+# Forwarded as a CMake variable; the env form is deprecated in torch.
+TORCH_CUDA_ARCH_LIST = { env = "TORCH_CUDA_ARCH_LIST" }
+
+[tool.ruff.lint]
+# "I" replaces the deleted [tool.isort]; extend-select keeps ruff defaults.
+extend-select = ["I"]
+
+[tool.pytest.ini_options]
+testpaths = ["examples"]
+addopts = "-v --tb=short"

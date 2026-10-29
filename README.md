@@ -1,10 +1,11 @@
 # DietGPU: GPU-based lossless compression for numerical data
 
-Author: Jeff Johnson (@wickedfoo), `jhj _at_ fb.com`
+**Original Author:** Jeff Johnson (@wickedfoo), `jhj _at_ fb.com`  
+**Fork Maintainer:** Yee Hin Chong (@yuxuan-z19), `yuxuan-z19 _at_ qq.com`
 
-*(NOTE: very early alpha preview of the library; it is still under rapid development)*
+> **Note:** This is a fork of the original [DietGPU](https://github.com/facebookresearch/dietgpu) project by Meta Platforms, which has been archived. This fork includes modernization updates, improved packaging, and additional features, including direct support for CUDA-compatible acclerators (e.g. T-Head SAIL series).
 
-DietGPU is a library for fast specialized lossless compression of data on Nvidia GPUs, meant for ML/HPC applications. It also contains the first publicly available GPU-based generalized [asymmetric numeral system (ANS)](https://en.wikipedia.org/wiki/Asymmetric_numeral_systems) compressor and decompressor. It is a GPU analogue to Yann Collet's [FSE (Finite State Entropy)](https://github.com/Cyan4973/FiniteStateEntropy) ANS library.
+DietGPU is a library for fast specialized lossless compression of data on CUDA-compatible devices, meant for ML/HPC applications. It also contains the first publicly available GPU-based generalized [asymmetric numeral system (ANS)](https://en.wikipedia.org/wiki/Asymmetric_numeral_systems) compressor and decompressor. It is a GPU analogue to Yann Collet's [FSE (Finite State Entropy)](https://github.com/Cyan4973/FiniteStateEntropy) ANS library.
 
 It currently consists of two parts:
 
@@ -13,32 +14,334 @@ It currently consists of two parts:
 
 Both APIs are available in both C++ (raw device pointers) and Python/PyTorch (PyTorch tensor) API forms.
 
+## Quick Start
+
+### Basic Compression
+
+```python
+import torch
+import dietgpu
+
+dev = torch.device("cuda:0")
+
+# Create test data
+tensors = [
+    torch.randn(10000, dtype=torch.float16, device=dev),
+    torch.randn(20000, dtype=torch.float16, device=dev),
+]
+
+# Simple compression
+compressed = dietgpu.compress_data_simple(True, tensors, checksum=True)
+print(f"Compressed {len(tensors)} tensors")
+
+# Simple decompression
+decompressed = dietgpu.decompress_data_simple(True, compressed, checksum=True)
+
+# Verify
+for orig, decomp in zip(tensors, decompressed):
+    assert torch.equal(orig, decomp)
+print("✓ Data verified!")
+```
+
+### Batch Compression with Full Control
+
+```python
+import torch
+import dietgpu
+
+dev = torch.device("cuda:0")
+tensors = [torch.randn(10000, dtype=torch.bfloat16, device=dev) for _ in range(5)]
+
+# Allocate temporary memory for better performance
+temp_mem = torch.empty([64 * 1024 * 1024], dtype=torch.uint8, device=dev)
+
+# Compress
+comp, sizes, mem_usage = dietgpu.compress_data(
+    compress_as_float=True,
+    ts_in=tensors,
+    checksum=True,
+    temp_mem=temp_mem
+)
+
+print(f"Compressed {len(tensors)} tensors")
+print(f"Memory used: {mem_usage / 1024 / 1024:.2f} MB")
+
+# Prepare output tensors
+out_tensors = [torch.empty(t.size(), dtype=t.dtype, device=dev) for t in tensors]
+
+# Decompress
+dietgpu.decompress_data(
+    compress_as_float=True,
+    ts_in=[comp],
+    ts_out=out_tensors,
+    checksum=True,
+    temp_mem=temp_mem
+)
+```
+
+### Split Compression
+
+```python
+import torch
+import dietgpu
+
+dev = torch.device("cuda:0")
+
+# Create a large tensor
+data = torch.randn(100000, dtype=torch.float32, device=dev)
+
+# Define split sizes
+split_sizes = torch.tensor([30000, 40000, 30000], dtype=torch.int32)
+
+# Compress as splits
+comp_list, sizes, mem = dietgpu.compress_data_split_size(
+    compress_as_float=True,
+    t_in=data,
+    t_in_split_sizes=split_sizes,
+    checksum=True
+)
+
+print(f"Split into {len(comp_list)} parts")
+
+# Decompress back
+output = torch.empty_like(data)
+dietgpu.decompress_data_split_size(
+    compress_as_float=True,
+    ts_in=comp_list,
+    t_out=output,
+    t_out_split_sizes=split_sizes,
+    checksum=True
+)
+
+assert torch.equal(data, output)
+print("✓ Split compression verified!")
+```
+
+## Supported Data Types
+
+- `torch.float16` (half precision)
+- `torch.bfloat16` (brain float16)
+- `torch.float32` (single precision)
+- Arbitrary byte data (when `compress_as_float=False`)
+
+## Performance Tips
+
+1. **Use temporary memory**: Pre-allocating `temp_mem` can improve performance by avoiding repeated allocations
+2. **Batch operations**: Compress multiple tensors together for better GPU utilization
+3. **Checksum**: Enable checksum for data integrity verification (small performance overhead)
+4. **Memory alignment**: For byte-level compression, ensure 16-byte alignment for best performance
+
 ## Documentation
 
 Documentation is [available in the wiki](https://github.com/facebookresearch/dietgpu/wiki).
 
-## Building
+See the [examples/](examples/) directory for more usage examples.
+
+## Installation
+
+> **Why `--no-build-isolation`?** DietGPU links `libtorch` directly, so it
+> must be compiled against the *same* PyTorch that will later import it.
+> PEP 517 build isolation hides your real environment; if `torch` were a
+> build requirement it would pull the newest version instead, producing a
+> package that installs fine but dies on import:
+>
+> ```
+> OSError: libdietgpu.so: undefined symbol: _ZN3c104impl22getGlobalPyInterpreterEv
+> ```
+>
+> The sections below show how to install with isolation off for each
+> scenario. Within the project tree, `[tool.uv]` in this repo's
+> `pyproject.toml` handles it automatically; everywhere else the flag must
+> be passed by hand.
+
+### Quick Install from PyPI or a Local Tarball
+
+dietgpu is distributed as an **sdist only** (no pre-built wheels). Whether the
+source comes from PyPI or a downloaded `dietgpu-*.tar.gz` (GitHub Releases, a
+private index, or `python -m build --sdist`), pip/uv will compile it locally.
+
+Both cases need the same `--no-build-isolation` flag, for the same reason:
+neither a PyPI sdist nor a tarball carries a workspace `pyproject.toml` that
+uv can read, so the `[tool.uv] no-build-isolation-package` setting in this
+repo has no effect. Build isolation stays on unless you turn it off
+explicitly -- and isolation would hide your real PyTorch from the build (see
+the callout above for what goes wrong).
+
+> **Tip:** If your own project depends on dietgpu, add this once to your
+> `pyproject.toml` so you never need the flag by hand:
+>
+> ```toml
+> [tool.uv]
+> no-build-isolation-package = ["dietgpu"]
+> ```
+>
+> With that in place, any `uv pip install` that resolves dietgpu -- from
+> PyPI, a tarball, or a local path -- builds it without isolation
+> automatically.
+
+#### PyPI
+
+```bash
+# uv still fetches scikit-build-core/cmake/ninja for you -- they are runtime
+# dependencies of the sdist.
+uv pip install dietgpu --no-build-isolation
+
+# pip: install the build tools once, then disable isolation
+pip install scikit-build-core ninja cmake
+pip install dietgpu --no-build-isolation
+```
+
+#### Local tarball
+
+```bash
+uv pip install --no-build-isolation /path/to/dietgpu-0.1.0.tar.gz
+pip install --no-build-isolation /path/to/dietgpu-0.1.0.tar.gz
+```
+
+Alternatively, extract first and let uv pick up the `[tool.uv]` setting
+from the unpacked tree:
+
+```bash
+tar xzf dietgpu-0.1.0.tar.gz && cd dietgpu-0.1.0
+uv pip install .   # [tool.uv] in pyproject.toml applies here
+```
+
+### Install from Source (Development Mode)
+
+```bash
+# Clone the repository
+git clone --recursive https://github.com/yuxuan-z19/dietgpu.git
+cd dietgpu
+
+# One command, no flags: uv installs torch and the build toolchain into the
+# target environment, then compiles against them.
+uv pip install -e .
+
+# Or using pip (build tools must already be present)
+pip install scikit-build-core ninja cmake
+pip install -e . --no-build-isolation
+```
+
+The installation will automatically:
+- Use Ninja build system (automatically managed by scikit-build-core)
+- Build the C++ library using CMake
+- Compile CUDA kernels
+- Install Python package and shared libraries
+
+**That's it!** No manual CMake or make commands needed.
+
+### Parallel Build Configuration
+
+Compilation is parallel by default: Ninja uses roughly one job per CPU core. To
+cap it, use CMake's own variable:
+
+```bash
+# Cap the number of parallel compile jobs
+export CMAKE_BUILD_PARALLEL_LEVEL=8
+uv pip install -e .
+
+# Or set it inline
+CMAKE_BUILD_PARALLEL_LEVEL=16 uv pip install -e .
+```
+
+> **`MAX_JOBS` does nothing here.** It is the convention from
+> `torch.utils.cpp_extension`, but scikit-build-core never reads it, and
+> `CMAKE_BUILD_PARALLEL_LEVEL` is an *environment* variable — setting it inside
+> CMake has no effect on `cmake --build`. Use the env var above.
+
+### Skipping the C++ Tests
+
+The gtest executables are built by default, which also builds googletest itself
+(four shared libraries). Turn them off to skip that:
+
+```bash
+CMAKE_ARGS="-DDIETGPU_BUILD_TESTS=OFF" uv pip install -e .
+```
+
+### Selecting the GPU Architecture
+
+By default the build probes the GPUs installed in the machine running the
+compiler and targets exactly those. That is the wrong question whenever the
+build machine is not the machine that will run dietgpu — CI runners, containers
+without device access, cross compilation — and on CUDA-compatible non-NVIDIA
+accelerators such as the Alibaba T-Head PPU. Pin the target explicitly instead:
+
+```bash
+# PyTorch's standard dotted form. Recommended: this one knob drives both
+# PyTorch's flags and dietgpu's own, so you get a single-architecture build.
+TORCH_CUDA_ARCH_LIST="8.9" uv pip install dietgpu --no-build-isolation
+
+# CMake's numeric form, when you need its -real / -virtual suffixes.
+DIETGPU_CUDA_ARCHITECTURES="89" uv pip install -e .
+
+# Several architectures at once (each one multiplies build time and size).
+TORCH_CUDA_ARCH_LIST="7.0;8.0;8.9" uv pip install -e .
+DIETGPU_CUDA_ARCHITECTURES="70;80;89" uv pip install -e .
+
+# The pip equivalents need the isolation flag spelled out:
+TORCH_CUDA_ARCH_LIST="8.9" pip install dietgpu --no-build-isolation
+DIETGPU_CUDA_ARCHITECTURES="89" pip install -e . --no-build-isolation
+```
+
+For a manual CMake build, pass the same two as `-D` options:
+`cmake .. -DTORCH_CUDA_ARCH_LIST=8.9` or `cmake .. -DCMAKE_CUDA_ARCHITECTURES=89`.
+
+Notes:
+
+- Prefer `TORCH_CUDA_ARCH_LIST`. Setting only `DIETGPU_CUDA_ARCHITECTURES`
+  leaves PyTorch free to append an architecture of its own (probed from the
+  build machine), so the result contains both.
+- With no GPU visible *and* neither variable set, CMake falls back to **every**
+  architecture that `nvcc` supports. dietgpu warns about this and the build
+  still succeeds, but it is many times slower and the binaries much larger —
+  pin one of the two variables.
+- The probe reports one entry per device, so a homogeneous multi-GPU machine
+  (e.g. 8× RTX 4090) is de-duplicated to a single architecture automatically.
+
+### System Requirements
+
+- **Python** >= 3.11
+- **PyTorch** >= 2.0.0 (with CUDA support)
+- **CUDA Toolkit** >= 11.0
+- **CMake** >= 3.18, < 4 (`CMAKE_CUDA_ARCHITECTURES` did not exist before 3.18;
+  on older CMake the architecture settings are silently ignored and nvcc falls
+  back to its own default. CMake 4.x is excluded because `third_party/glog`
+  calls `cmake_policy(VERSION 3.3)`, and 4.x has dropped compatibility with
+  anything below 3.5). Installed for you by `uv pip install`; only the pip route
+  needs it present beforehand.
+- **Ninja** (or GNU Make as a fallback). Also installed for you by uv.
+- **C++ Compiler** (with C++17 support)
+- **CUDA-compatible GPU** (for actual compression/decompression)
+  - Tested on: NVIDIA GPUs (A100, RTX4090, etc.)
+  - Also compatible with: Alibaba T-Head PPU and other CUDA-compatible accelerators
+
+### Verify Installation
+
+```python
+import torch
+import dietgpu
+
+print(f"DietGPU version: {dietgpu.__version__}")
+
+# Test compression
+dev = torch.device("cuda:0")
+tensors = [torch.randn(10000, dtype=torch.float16, device=dev)]
+compressed = dietgpu.compress_data_simple(True, tensors)
+print(f"✓ Compression successful!")
+```
+
+## Building from Source (Manual)
+
+If you prefer to build manually or need to customize the build:
+
+### Manual CMake Build
 
 Clone this repo using
 
 ```shell
 git clone --recursive https://github.com/facebookresearch/dietgpu
 cd dietgpu
-```
-
-Then the simplest way is to use the included Dockerfile, which installs the PyTorch dependencies *and* uses NVIDIA's dev image as a base (for the CUDA dependencies):
-
-```shell
-docker build -t dietgpu .
-docker run --privileged --runtime=nvidia --rm -v $(pwd):/dietgpu -it dietgpu:latest
-```
-
-Note you need NVIDIA's container runtime installed (if on Fedora consult this [Github issue](https://github.com/NVIDIA/nvidia-docker/issues/706#issuecomment-851816502)).
-
-Then do the standard CMake thing:
-
-```shell
-cd dietgpu; mkdir build; cd build;
+mkdir build && cd build
 cmake .. -G Ninja
 cmake --build . --target all
 ```
@@ -129,3 +432,9 @@ These works are sometimes oriented at compressing HPC-type data (e.g., 2d/3d/Nd 
 ## License
 
 DietGPU is licensed with the MIT license, available in the LICENSE file at the top level.
+
+The original work is Copyright (c) Meta Platforms, Inc. and affiliates.
+Modifications in this fork are Copyright (c) 2026 Yee Hin Chong (yuxuan-z).
+
+This is an unofficial fork maintained by an individual contributor. It is not endorsed by, sponsored by, or affiliated with Meta Platforms, Inc.
+For the upstream project, see https://github.com/facebookresearch/dietgpu.

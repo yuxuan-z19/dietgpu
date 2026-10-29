@@ -13,4 +13,4 @@ namespace dietgpu {
 
 constexpr int kWarpSize = 32;
 
-} // namespace dietgpu
+}  // namespace dietgpu

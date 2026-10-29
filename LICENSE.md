@@ -1,6 +1,7 @@
 MIT License
 
 Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright (c) 2026 Yee Hin Chong (yuxuan-z) — modifications to the original work
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

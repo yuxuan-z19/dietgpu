@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cuda.h>
+
 #include "dietgpu/utils/StackDeviceMemory.h"
 
 namespace dietgpu {
@@ -15,47 +16,55 @@ namespace dietgpu {
 // Required minimum alignment in bytes of all data to be compressed in the batch
 constexpr int kANSRequiredAlignment = 4;
 
-// Default number of probability quantization bits to use, if an alternative is
-// not specified
+// The only number of probability quantization bits this build instantiates.
+// The ANS kernels are templated on it, so each additional precision multiplies
+// every kernel by the number of provider combinations; 9 and 11 were dropped
+// because that matrix -- not any individual kernel -- dominated build time.
 constexpr int kANSDefaultProbBits = 10;
 
 uint32_t getMaxCompressedSize(uint32_t uncompressedBytes);
 
 struct ANSCodecConfig {
-  inline ANSCodecConfig() : probBits(kANSDefaultProbBits), useChecksum(false) {}
+    inline ANSCodecConfig()
+        : probBits(kANSDefaultProbBits), useChecksum(false) {}
 
-  explicit inline ANSCodecConfig(int pb, bool checksum = false)
-      : probBits(pb), useChecksum(checksum) {}
+    explicit inline ANSCodecConfig(int pb, bool checksum = false)
+        : probBits(pb), useChecksum(checksum) {}
 
-  // What the ANS probability accuracy is; all symbols have quantized
-  // probabilities of 1/2^probBits.
-  // 9, 10, 11 are only valid values. When in doubt, use 10 (e.g., all symbol
-  // probabilities are one of {1/1024, 2/1024, ..., 1023/1024, 1024/1024})
-  int probBits;
+    // What the ANS probability accuracy is; all symbols have quantized
+    // probabilities of 1/2^probBits (at 10, every symbol probability is one of
+    // {1/1024, 2/1024, ..., 1023/1024, 1024/1024}).
+    //
+    // Only kANSDefaultProbBits is accepted; any other value trips a CHECK in
+    // ansEncodeBatchDevice / ansDecodeBatch. The precision is recorded in the
+    // archive header, so archives written by an older dietgpu at 9 or 11 are
+    // NOT readable by this build: re-compress them, or restore the extra
+    // instantiations in GpuANSEncode.cuh / GpuANSDecode.cuh if you need them.
+    int probBits;
 
-  // If true, we calculate a checksum on the uncompressed input data to
-  // compression and store it in the archive, and on the decompression side
-  // post-decompression, we calculate a checksum on the decompressed data which
-  // is compared with the original stored in the archive.
-  // This is an optional feature useful if DietGPU data will be stored
-  // persistently on disk.
-  bool useChecksum;
+    // If true, we calculate a checksum on the uncompressed input data to
+    // compression and store it in the archive, and on the decompression side
+    // post-decompression, we calculate a checksum on the decompressed data
+    // which is compared with the original stored in the archive. This is an
+    // optional feature useful if DietGPU data will be stored persistently on
+    // disk.
+    bool useChecksum;
 };
 
 enum class ANSDecodeError : uint32_t {
-  None = 0,
-  ChecksumMismatch = 1,
+    None = 0,
+    ChecksumMismatch = 1,
 };
 
 // Error status for decompression
 struct ANSDecodeStatus {
-  inline ANSDecodeStatus() : error(ANSDecodeError::None) {}
+    inline ANSDecodeStatus() : error(ANSDecodeError::None) {}
 
-  // Overall error status
-  ANSDecodeError error;
+    // Overall error status
+    ANSDecodeError error;
 
-  // Error-specific information for the batch
-  std::vector<std::pair<int, std::string>> errorInfo;
+    // Error-specific information for the batch
+    std::vector<std::pair<int, std::string>> errorInfo;
 };
 
 //
@@ -340,4 +349,4 @@ void ansGetCompressedInfoDevice(
     // stream on the current device on which this runs
     cudaStream_t stream);
 
-} // namespace dietgpu
+}  // namespace dietgpu
