@@ -4,31 +4,17 @@
 # This source code is licensed under the MIT-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# The declared minimum is deliberately *below* the real floor. Raising it to
-# 3.18 turns CMP0104 ON, and under that policy CMake pre-populates
-# CMAKE_CUDA_ARCHITECTURES with nvcc's default architecture (52 on CUDA 12.6)
-# while enabling the CUDA language in project(). The architecture block below
-# then cannot tell "the caller asked for 52" from "nobody asked anything", so
-# every default build would silently target sm_52. Gate the real floor
-# explicitly instead of through the policy level.
-cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
-if(CMAKE_VERSION VERSION_LESS 3.18)
-    # Keep the lines short: CMake re-wraps FATAL_ERROR text
-    # at roughly 70 columns *including* its own 8-space indent.
-    message(FATAL_ERROR
-        "dietgpu needs CMake >= 3.18, found\n"
-        "${CMAKE_VERSION}.\n"
-        "\n"
-        "CMAKE_CUDA_ARCHITECTURES and the\n"
-        "CUDA_ARCHITECTURES target property only exist\n"
-        "from 3.18 on. On older CMake every\n"
-        "architecture setting in this file is silently\n"
-        "ignored and nvcc falls back to its own\n"
-        "default, producing a package that installs\n"
-        "but will not run.")
-endif()
+# CMake 3.22 is the real floor: required by third_party/ng-log (ng-log v0.8.4).
+# CMAKE_CUDA_ARCHITECTURES and the CUDA_ARCHITECTURES target property did not
+# exist before 3.18. Declared honestly rather than through a separate guard --
+# the old trick of keeping the minimum below the real floor to dodge CMP0104
+# is no longer needed now that the architecture block below uses its own
+# variable name (DIETGPU_CUDA_ARCHITECTURES) instead of CMAKE_CUDA_ARCHITECTURES
+# for the caller-supplied override, so project()'s pre-population under CMP0104
+# NEW cannot silently hijack the detection logic.
+cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 project(dietgpu LANGUAGES CUDA CXX VERSION 1.0)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
@@ -72,7 +58,7 @@ if(NOT CMAKE_PREFIX_PATH OR CMAKE_PREFIX_PATH STREQUAL "")
     endif()
 endif()
 
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Legacy FindCUDA, deliberately kept: it is load-bearing on two fronts --
@@ -83,14 +69,81 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # too, which is a migration rather than a simplification.
 find_package(CUDA REQUIRED)
 
+# ---- PyTorch C++ ABI alignment (MUST precede every add_subdirectory) ----
+# PyTorch wheels were built with a fixed libstdc++ ABI (torch<=2.x manylinux
+# wheels use the pre-C++11 ABI: -D_GLIBCXX_USE_CXX11_ABI=0). Only targets that
+# link torch inherit this flag; the pure CUDA/C++ sub-libraries (dietgpu_utils,
+# gpu_ans, gpu_float_compress) would otherwise use the compiler default (new ABI
+# on gcc>=5), so any std::string crossing the boundary (e.g. dietgpu::errorToName)
+# gets a different mangled name -> "undefined symbol" at load time.
+#
+# TORCH_CXX_FLAGS carries the exact -D_GLIBCXX_USE_CXX11_ABI=<v> that matches the
+# installed torch. Reading it (instead of hardcoding 0) keeps every target
+# consistent automatically across torch/CUDA versions. Applied to BOTH CXX and
+# CUDA so the host side of .cu files uses the same ABI.
+#
+# This also populates TORCH_CUDA_ARCH_LIST, which the architecture selection
+# block below checks to decide whether to defer to PyTorch's own arch flags.
+find_package(Torch QUIET)
+if(NOT Torch_FOUND)
+    # Keep every line short: CMake re-wraps FATAL_ERROR text at roughly
+    # 70 columns *including* its own 8-space indent, and long lines get
+    # broken mid-sentence into unreadable fragments.
+    message(FATAL_ERROR
+        "PyTorch (Torch CMake package) not found.\n"
+        "  CMAKE_PREFIX_PATH: '${CMAKE_PREFIX_PATH}'\n"
+        "  probed interpreter:\n"
+        "    ${DIETGPU_PYTHON_EXECUTABLE}\n"
+        "\n"
+        "dietgpu links libtorch directly, so it must be\n"
+        "built against the SAME torch that imports it.\n"
+        "Otherwise it installs fine but fails on import\n"
+        "with 'undefined symbol' (version/ABI mismatch).\n"
+        "\n"
+        "Build isolation hides your runtime torch:\n"
+        "uv repoints VIRTUAL_ENV, PATH and the\n"
+        "probed interpreter at the throwaway build\n"
+        "env, leaving nothing that names the real\n"
+        "one. So isolation is unsupported, and\n"
+        "torch is not in build-system.requires on\n"
+        "purpose.\n"
+        "\n"
+        "With uv, from inside the project tree,\n"
+        "nothing else is needed: the build tools\n"
+        "are listed as runtime dependencies and\n"
+        "[tool.uv] turns isolation off, so uv\n"
+        "installs them first and then compiles.\n"
+        "  uv pip install -e .\n"
+        "\n"
+        "With pip, or with uv run from outside the\n"
+        "tree, install the build deps once and\n"
+        "disable isolation yourself:\n"
+        "  pip install scikit-build-core ninja cmake\n"
+        "  pip install --no-build-isolation -e .\n"
+        "  pip install --no-build-isolation dietgpu\n"
+        "\n"
+        "Or point CMake at your torch explicitly:\n"
+        "  export CMAKE_PREFIX_PATH=<torch>/share/cmake"
+    )
+endif()
+set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${TORCH_CXX_FLAGS}")
+message(STATUS "dietgpu: aligning all targets to TORCH_CXX_FLAGS='${TORCH_CXX_FLAGS}'")
+
 # ---- CUDA architecture selection ----
 # Resolution order:
-#   1. CMAKE_CUDA_ARCHITECTURES supplied by the caller -- always wins,
-#      including when it is OFF ("add no arch flags of our own").
-#   2. TORCH_CUDA_ARCH_LIST supplied by the caller -- find_package(Torch) below
-#      turns it into -gencode flags on CMAKE_CUDA_FLAGS, which reach every CUDA
-#      target in this project, so we stand down rather than add a second and
-#      possibly different list.
+#   1. DIETGPU_CUDA_ARCHITECTURES supplied by the caller (via -D or env var)
+#      -- always wins, including when it is OFF ("add no arch flags of our
+#      own"). Named separately from CMAKE_CUDA_ARCHITECTURES to dodge CMP0104:
+#      under CMake 3.18+ that policy pre-populates CMAKE_CUDA_ARCHITECTURES
+#      with nvcc's default (52 on CUDA 12.6) inside project(), making it
+#      impossible to distinguish "caller asked for 52" from "nobody asked
+#      anything". Using a project-specific variable keeps the detection logic
+#      honest.
+#   2. TORCH_CUDA_ARCH_LIST supplied by the caller -- find_package(Torch)
+#      below turns it into -gencode flags on CMAKE_CUDA_FLAGS, which reach
+#      every CUDA target in this project, so we stand down rather than add a
+#      second and possibly different list.
 #   3. Local GPU detection.
 #
 # Detection compiles and runs a probe program, so it can only ever describe the
@@ -100,7 +153,7 @@ find_package(CUDA REQUIRED)
 #   - the target is a CUDA-compatible non-NVIDIA accelerator (e.g. Alibaba
 #     T-Head PPU), whose architecture naming only its own toolchain knows.
 # The probe result used to be assigned unconditionally, which silently threw
-# away whatever was passed via -DCMAKE_CUDA_ARCHITECTURES or CMAKE_ARGS and
+# away whatever was passed via -DDIETGPU_CUDA_ARCHITECTURES or CMAKE_ARGS and
 # left no way to target anything but the local GPU. Worse, when the probe sees
 # no device CMake does not return an empty list -- it falls back to *every*
 # architecture that nvcc supports (8 of them on CUDA 12.6), so a GPU-less build
@@ -108,17 +161,11 @@ find_package(CUDA REQUIRED)
 #
 # Test DEFINED rather than truthiness: "OFF" is a legitimate explicit value but
 # is false in a plain if(), and would have fallen through to detection.
-#
-# This test only works because cmake_minimum_required above stays below 3.18,
-# which keeps CMP0104 OLD. Under CMP0104 NEW, project() pre-populates
-# CMAKE_CUDA_ARCHITECTURES with nvcc's default (52 on CUDA 12.6), the test
-# becomes permanently true, and every default build silently targets sm_52 --
-# verified, not hypothetical. If the declared minimum is ever raised, this block
-# must switch to its own variable name for the caller-supplied override.
-if(DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+if(DEFINED DIETGPU_CUDA_ARCHITECTURES AND NOT DIETGPU_CUDA_ARCHITECTURES STREQUAL "")
     message(STATUS "dietgpu: honoring caller-supplied "
-        "CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}', "
+        "DIETGPU_CUDA_ARCHITECTURES='${DIETGPU_CUDA_ARCHITECTURES}', "
         "local GPU detection skipped")
+    set(CMAKE_CUDA_ARCHITECTURES ${DIETGPU_CUDA_ARCHITECTURES})
 elseif(TORCH_CUDA_ARCH_LIST OR DEFINED ENV{TORCH_CUDA_ARCH_LIST})
     # OFF is exactly what caffe2/public/cuda.cmake sets for the same purpose:
     # it makes CMake add no CUDA_ARCHITECTURES flags of its own and leaves the
@@ -198,64 +245,6 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# ---- PyTorch C++ ABI alignment (MUST precede every add_subdirectory) ----
-# PyTorch wheels are built with a fixed libstdc++ ABI (torch<=2.x manylinux
-# wheels use the pre-C++11 ABI: -D_GLIBCXX_USE_CXX11_ABI=0). Only targets that
-# link torch inherit this flag; the pure CUDA/C++ sub-libraries (dietgpu_utils,
-# gpu_ans, gpu_float_compress) would otherwise use the compiler default (new ABI
-# on gcc>=5), so any std::string crossing the boundary (e.g. dietgpu::errorToName)
-# gets a different mangled name -> "undefined symbol" at load time.
-#
-# TORCH_CXX_FLAGS carries the exact -D_GLIBCXX_USE_CXX11_ABI=<v> that matches the
-# installed torch. Reading it (instead of hardcoding 0) keeps every target
-# consistent automatically across torch/CUDA versions. Applied to BOTH CXX and
-# CUDA so the host side of .cu files uses the same ABI.
-find_package(Torch QUIET)
-if(NOT Torch_FOUND)
-    # Keep every line short: CMake re-wraps FATAL_ERROR text at roughly
-    # 70 columns *including* its own 8-space indent, and long lines get
-    # broken mid-sentence into unreadable fragments.
-    message(FATAL_ERROR
-        "PyTorch (Torch CMake package) not found.\n"
-        "  CMAKE_PREFIX_PATH: '${CMAKE_PREFIX_PATH}'\n"
-        "  probed interpreter:\n"
-        "    ${DIETGPU_PYTHON_EXECUTABLE}\n"
-        "\n"
-        "dietgpu links libtorch directly, so it must be\n"
-        "built against the SAME torch that imports it.\n"
-        "Otherwise it installs fine but fails on import\n"
-        "with 'undefined symbol' (version/ABI mismatch).\n"
-        "\n"
-        "Build isolation hides your runtime torch:\n"
-        "uv repoints VIRTUAL_ENV, PATH and the\n"
-        "probed interpreter at the throwaway build\n"
-        "env, leaving nothing that names the real\n"
-        "one. So isolation is unsupported, and\n"
-        "torch is not in build-system.requires on\n"
-        "purpose.\n"
-        "\n"
-        "With uv, from inside the project tree,\n"
-        "nothing else is needed: the build tools\n"
-        "are listed as runtime dependencies and\n"
-        "[tool.uv] turns isolation off, so uv\n"
-        "installs them first and then compiles.\n"
-        "  uv pip install -e .\n"
-        "\n"
-        "With pip, or with uv run from outside the\n"
-        "tree, install the build deps once and\n"
-        "disable isolation yourself:\n"
-        "  pip install scikit-build-core ninja cmake\n"
-        "  pip install --no-build-isolation -e .\n"
-        "  pip install --no-build-isolation dietgpu\n"
-        "\n"
-        "Or point CMake at your torch explicitly:\n"
-        "  export CMAKE_PREFIX_PATH=<torch>/share/cmake"
-    )
-endif()
-set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${TORCH_CXX_FLAGS}")
-message(STATUS "dietgpu: aligning all targets to TORCH_CXX_FLAGS='${TORCH_CXX_FLAGS}'")
-
 # ---- Install-tree RPATH (MUST precede every add_subdirectory) ----
 # The wheel layout splits the extension from its CUDA siblings:
 #   dietgpu/libdietgpu.so
@@ -299,7 +288,7 @@ set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/lib")
 set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
 set(WITH_GTEST OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF)
-add_subdirectory(third_party/glog)
+add_subdirectory(third_party/ng-log)
 set(BUILD_TESTING ON)
 
 # googletest is needed only by the C++ test executables in dietgpu/{ans,float}.
@@ -329,24 +318,24 @@ add_subdirectory(dietgpu/float)
 # Every rule is COMPONENT python, which is what lets
 # install.components = ["python"] in pyproject.toml drop the sub-projects' own
 # rules from the wheel.
-# glog declares PUBLIC_HEADER, so installing only its LIBRARY makes CMake warn
+# ng-log declares PUBLIC_HEADER, so installing only its LIBRARY makes CMake warn
 # on every configure. Only the runtime .so belongs in the wheel / prefix -- the
-# headers are build-time only and are reachable through glog's own CMake package
+# headers are build-time only and are reachable through ng-log's own CMake package
 # in a development build -- so clear the property rather than give it a
 # destination. Applies to both branches below.
-set_target_properties(glog PROPERTIES PUBLIC_HEADER "")
+set_target_properties(ng-log PROPERTIES PUBLIC_HEADER "")
 if(SKBUILD)
     install(TARGETS dietgpu
         LIBRARY DESTINATION dietgpu
         COMPONENT python
     )
-    install(TARGETS gpu_float_compress gpu_ans dietgpu_utils glog
+    install(TARGETS gpu_float_compress gpu_ans dietgpu_utils ng-log
         LIBRARY DESTINATION dietgpu/lib
         COMPONENT python
     )
 else()
     # Regular cmake build (for development)
-    install(TARGETS dietgpu gpu_float_compress gpu_ans dietgpu_utils glog
+    install(TARGETS dietgpu gpu_float_compress gpu_ans dietgpu_utils ng-log
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin

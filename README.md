@@ -284,7 +284,7 @@ DIETGPU_CUDA_ARCHITECTURES="89" pip install -e . --no-build-isolation
 ```
 
 For a manual CMake build, pass the same two as `-D` options:
-`cmake .. -DTORCH_CUDA_ARCH_LIST=8.9` or `cmake .. -DCMAKE_CUDA_ARCHITECTURES=89`.
+`cmake .. -DTORCH_CUDA_ARCH_LIST=8.9` or `cmake .. -DDIETGPU_CUDA_ARCHITECTURES=89`.
 
 Notes:
 
@@ -303,11 +303,12 @@ Notes:
 - **Python** >= 3.11
 - **PyTorch** >= 2.0.0 (with CUDA support)
 - **CUDA Toolkit** >= 11.0
-- **CMake** >= 3.18, < 4 (`CMAKE_CUDA_ARCHITECTURES` did not exist before 3.18;
-  on older CMake the architecture settings are silently ignored and nvcc falls
-  back to its own default. CMake 4.x is excluded because `third_party/glog`
-  calls `cmake_policy(VERSION 3.3)`, and 4.x has dropped compatibility with
-  anything below 3.5). Installed for you by `uv pip install`; only the pip route
+- **CMake** >= 3.22 (CMake 3.22 is required by third_party/ng-log (ng-log v0.8.4);
+  dietgpu uses `DIETGPU_CUDA_ARCHITECTURES` instead of `CMAKE_CUDA_ARCHITECTURES`
+  to dodge CMP0104 pre-population, but the 3.18 floor is still required for the
+  underlying CMake feature to exist. No upper bound: ng-log uses
+  `cmake_policy(VERSION 3.16...3.27)`, compatible with CMake 4.x). Installed
+  for you by `uv pip install`; only the pip route
   needs it present beforehand.
 - **Ninja** (or GNU Make as a fallback). Also installed for you by uv.
 - **C++ Compiler** (with C++17 support)
