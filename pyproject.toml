@@ -4,7 +4,7 @@
 # and dies on import with "undefined symbol". Build isolation is disabled via
 # [tool.uv] below; the toolchain lives in [project].dependencies instead.
 #
-# Floor is 1.0: cmake.version as a specifier set (">=3.18,<4") requires
+# Floor is 1.0: cmake.version as a specifier set (">=3.22") requires
 # scikit-build-core >= 0.8; earlier versions use the deprecated
 # cmake.minimum-version key and silently ignore this setting.
 requires = ["scikit-build-core>=1.0"]
@@ -45,9 +45,9 @@ classifiers = [
 dependencies = [
     "torch",
     "scikit-build-core>=1.0",
-    # cmake<4 cap: CMake 4.x rejects cmake_policy(VERSION 3.3) in
-    # third_party/glog. Keep in sync with cmake.version below.
-    "cmake>=3.18,<4",
+    # No <4 cap: ng-log v0.8.4 uses cmake_policy(VERSION 3.16...3.27),
+    # googletest v1.18.0 has no cmake_policy. Both are CMake 4.x compatible.
+    "cmake>=3.22",
     "ninja>=1.11",
 ]
 
@@ -71,12 +71,13 @@ Documentation = "https://github.com/yuxuan-z19/dietgpu#readme"
 no-build-isolation-package = ["dietgpu"]
 
 [tool.scikit-build]
-# 3.18 introduced CMAKE_CUDA_ARCHITECTURES; deliberately NOT mirrored by
-# cmake_minimum_required in CMakeLists.txt (see comment there on CMP0104).
-# The <4 cap must be repeated here because this covers the path where
-# scikit-build-core provisions cmake for an isolated build on a machine
-# without a system cmake. Keep in sync with [project].dependencies.
-cmake.version = ">=3.18,<4"
+# 3.22 is required by third_party/ng-log (ng-log v0.8.4); cmake_minimum_required
+# in CMakeLists.txt declares 3.22 honestly. The architecture block uses
+# DIETGPU_CUDA_ARCHITECTURES (not CMAKE_CUDA_ARCHITECTURES) for the caller
+# override to dodge CMP0104 pre-population. No <4 cap: ng-log uses
+# cmake_policy(VERSION 3.16...3.27), compatible with CMake 4.x. Keep in sync
+# with [project].dependencies.
+cmake.version = ">=3.22"
 cmake.build-type = "Release"
 wheel.packages = ["dietgpu"]
 build-dir = "build/{wheel_tag}"
@@ -92,9 +93,9 @@ CMAKE_PREFIX_PATH = { env = "CMAKE_PREFIX_PATH", default = "" }
 
 # Escape hatch for target GPU architectures (e.g. "89" or "70;80;89").
 # Needed for GPU-less CI, cross-compilation, and non-NVIDIA accelerators.
-# No `default` key: `default = ""` would pass an empty -DCMAKE_CUDA_ARCHITECTURES=
+# No `default` key: `default = ""` would pass an empty -DDIETGPU_CUDA_ARCHITECTURES=
 # which CMake rejects outright.
-CMAKE_CUDA_ARCHITECTURES = { env = "DIETGPU_CUDA_ARCHITECTURES" }
+DIETGPU_CUDA_ARCHITECTURES = { env = "DIETGPU_CUDA_ARCHITECTURES" }
 
 # find_package(Torch) appends its own -gencode flags driven by
 # TORCH_CUDA_ARCH_LIST (dotted form: "8.9", "8.0;8.9", "all").

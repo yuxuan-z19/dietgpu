@@ -175,3 +175,27 @@ def test_split_decompress():
                 )
 
                 assert torch.equal(t, decomp_t)
+
+
+def main():
+    if not torch.cuda.is_available():
+        raise RuntimeError("DietGPU requires a CUDA device")
+
+    print(f"device: {torch.cuda.get_device_name(0)}")
+    print(f"torch:  {torch.__version__}")
+
+    for test in [
+        test_codec,
+        test_large,
+        test_simple,
+        test_empty,
+        test_split_compress,
+        test_split_decompress,
+    ]:
+        test()
+
+    print("\nall uint8 checks passed")
+
+
+if __name__ == "__main__":
+    main()
