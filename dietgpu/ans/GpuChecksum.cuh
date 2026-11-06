@@ -23,9 +23,13 @@ struct ReduceXor {
     }
 };
 
+// Variant taking its block reduce scratch from the caller, so that a kernel
+// running several phases can overlay it with other phases' scratch. The
+// overload below declares its own and forwards here.
 template <int Threads>
-__device__ void checksumSingle(const uint8_t* __restrict__ in, uint32_t size,
-                               uint32_t* __restrict__ out) {
+__device__ void checksumSingle(
+    const uint8_t* __restrict__ in, uint32_t size, uint32_t* __restrict__ out,
+    typename cub::BlockReduce<uint32_t, Threads>::TempStorage& reduceScratch) {
     // FIXME: general presumption in dietgpu that input data for ANS is only
     // byte aligned, while float data is only float word aligned, whereas
     // ideally we would like a 32 bit checksum. Since there is ultimately no
@@ -82,13 +86,22 @@ __device__ void checksumSingle(const uint8_t* __restrict__ in, uint32_t size,
 
     // Reduce within a warp
     using BlockReduce = cub::BlockReduce<uint32_t, Threads>;
-    __shared__ typename BlockReduce::TempStorage smem;
 
-    checksum32 = BlockReduce(smem).Reduce(checksum32, ReduceXor<uint32_t>());
+    checksum32 =
+        BlockReduce(reduceScratch).Reduce(checksum32, ReduceXor<uint32_t>());
 
     if (threadIdx.x == 0) {
         atomicXor(out, checksum32);
     }
+}
+
+template <int Threads>
+__device__ void checksumSingle(const uint8_t* __restrict__ in, uint32_t size,
+                               uint32_t* __restrict__ out) {
+    using BlockReduce = cub::BlockReduce<uint32_t, Threads>;
+    __shared__ typename BlockReduce::TempStorage smem;
+
+    checksumSingle<Threads>(in, size, out, smem);
 }
 
 template <typename InProvider, int Threads>
@@ -113,10 +126,8 @@ void checksumBatch(uint32_t numInBatch, InProvider inProvider,
     // We unfortunately don't know the per-batch element sizes in advance
     // What is the maximum number of blocks to saturate the GPU just in case
     // some per-batch members are big?
-    int maxBlocks = 0;
-    CUDA_VERIFY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &maxBlocks, checksumBatch<InProvider, kThreads>, kThreads, 0));
-    maxBlocks *= getCurrentDeviceProperties().multiProcessorCount;
+    int maxBlocks =
+        getMaxResidentBlocks(checksumBatch<InProvider, kThreads>, kThreads);
 
     // The y block dimension will be for each batch element
     uint32_t xBlocks = divUp(maxBlocks, numInBatch);

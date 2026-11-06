@@ -11,7 +11,10 @@
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 
+#include <map>
+#include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
 /// Wrapper to test return status of CUDA functions
@@ -98,6 +101,82 @@ size_t getMaxSharedMemPerBlock(int device);
 
 /// Equivalent to getMaxSharedMemPerBlock(getCurrentDevice())
 size_t getMaxSharedMemPerBlockCurrentDevice();
+
+/// Returns how many blocks of `threads` threads running `kernel` can be
+/// concurrently resident on `device`: the per-multiprocessor occupancy times
+/// the multiprocessor count. This is what every launch site in the library uses
+/// to size a grid that saturates the GPU.
+///
+/// Cached per (device, kernel, threads, smem), because the answer cannot change
+/// for the lifetime of the process while the underlying
+/// cudaOccupancyMaxActiveBlocksPerMultiprocessor is a host-side driver call
+/// costing ~0.6 us -- not free when an entire compress invocation only spends
+/// ~32 us on the host.
+///
+/// Defined inline (rather than in DeviceUtils.cpp) so that the cache is a
+/// single instance shared by every translation unit, which is what the standard
+/// guarantees for static locals of an inline function.
+inline int getMaxResidentBlocksForDevice(int device, const void* kernel,
+                                         int threads, int smem = 0) {
+    using Key = std::tuple<int, const void*, int, int>;
+
+    // std::map, not unordered_map: the standard library provides no
+    // std::hash<std::tuple>, and this cache holds a handful of entries (one per
+    // launch site) so lookup cost is irrelevant.
+    static std::mutex mutex;
+    static std::map<Key, int> blocks;
+
+    auto key = Key(device, kernel, threads, smem);
+
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+
+        auto it = blocks.find(key);
+        if (it != blocks.end()) {
+            return it->second;
+        }
+    }
+
+    // Queried outside the lock: the driver call is slow enough that holding the
+    // lock across it would serialize concurrent first-time callers, and two
+    // threads arriving at the same answer is harmless -- emplace keeps
+    // whichever gets there first.
+    int maxBlocksPerSM = 0;
+    CUDA_VERIFY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &maxBlocksPerSM, kernel, threads, smem));
+
+    int maxBlocks =
+        maxBlocksPerSM * getDeviceProperties(device).multiProcessorCount;
+
+    std::lock_guard<std::mutex> guard(mutex);
+    blocks.emplace(key, maxBlocks);
+
+    return maxBlocks;
+}
+
+/// Equivalent to getMaxResidentBlocksForDevice(getCurrentDevice(), ...)
+template <typename KernelT>
+int getMaxResidentBlocks(KernelT kernel, int threads, int smem = 0) {
+    return getMaxResidentBlocksForDevice(getCurrentDevice(),
+                                         (const void*)kernel, threads, smem);
+}
+
+/// Does `device` support cudaLaunchCooperativeKernel? A device property, so it
+/// is already cached by getDeviceProperties.
+///
+/// Callers that can work either way must check this rather than attempt the
+/// launch: a cooperative launch on a device without support is not a soft
+/// failure, it is cudaErrorInvalidConfiguration, and this library wraps launch
+/// errors in a CHECK that aborts the process. Not every CUDA-compatible device
+/// supports it.
+inline bool getCooperativeLaunchSupport(int device) {
+    return getDeviceProperties(device).cooperativeLaunch != 0;
+}
+
+/// Equivalent to getCooperativeLaunchSupport(getCurrentDevice())
+inline bool getCooperativeLaunchSupportCurrentDevice() {
+    return getCooperativeLaunchSupport(getCurrentDevice());
+}
 
 /// For a given pointer, returns whether or not it is located on
 /// a device (deviceId >= 0) or the host (-1).

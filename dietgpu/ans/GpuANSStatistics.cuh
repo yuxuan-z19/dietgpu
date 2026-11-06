@@ -19,15 +19,15 @@
 
 namespace dietgpu {
 
+// Variant taking its per-warp buckets from the caller, so that a kernel running
+// several phases can overlay this scratch with that of phases a grid barrier
+// separates it from. The overload below declares its own and forwards here.
 template <int Threads>
 __device__ void histogramSingle(const ANSDecodedT* __restrict__ in,
-                                uint32_t size, uint32_t* __restrict__ out) {
+                                uint32_t size, uint32_t* __restrict__ out,
+                                uint32_t (*buckets)[kNumSymbols + 1]) {
     constexpr int kWarps = Threads / kWarpSize;
     static_assert(Threads == kNumSymbols, "");
-
-    // +1 in order to force very common symbols that could overlap into
-    // different banks?
-    __shared__ uint32_t buckets[kWarps][kNumSymbols + 1];
 
     auto warpId = threadIdx.x / kWarpSize;
 
@@ -133,6 +133,33 @@ __device__ void histogramSingle(const ANSDecodedT* __restrict__ in,
     }
 }
 
+template <int Threads>
+__device__ void histogramSingle(const ANSDecodedT* __restrict__ in,
+                                uint32_t size, uint32_t* __restrict__ out) {
+    constexpr int kWarps = Threads / kWarpSize;
+
+    // +1 in order to force very common symbols that could overlap into
+    // different banks?
+    __shared__ uint32_t buckets[kWarps][kNumSymbols + 1];
+
+    histogramSingle<Threads>(in, size, out, buckets);
+}
+
+// Everything normalizeProbabilitiesFromHistogram needs in shared memory, as one
+// object so that a caller can overlay it with other phases' scratch. Sized by
+// the cub radix sort, which is the largest piece.
+template <int Threads>
+struct ANSNormalizeScratch {
+    static constexpr int kNumSymPerThread =
+        kNumSymbols == Threads ? 1 : (kNumSymbols / Threads);
+
+    int sum[Threads / kWarpSize];
+    typename cub::BlockRadixSort<uint32_t, Threads,
+                                 kNumSymPerThread>::TempStorage sort;
+    uint32_t pdf[kNumSymbols];
+    typename cub::BlockScan<uint32_t, Threads>::TempStorage scan;
+};
+
 template <typename InProvider, int Threads>
 __global__ void histogramBatch(InProvider in, uint32_t* out) {
     auto batch = blockIdx.y;
@@ -175,11 +202,14 @@ __device__ inline int blockSum(int warpId, int laneId, int valForSum,
 // Function that allows normalization of symbol probabilities with a varying
 // (statically known) number of threads, to allow for kernel fusion as needed
 // Stand-alone normalization will use Threads == kNumSymbols (256)
+//
+// This variant takes its shared memory from the caller; the overload below
+// declares its own.
 template <int Threads>
 __device__ void normalizeProbabilitiesFromHistogram(
     // Size 256 histogram in gmem
     const uint32_t* __restrict__ counts, uint32_t totalNum, int probBits,
-    uint4* __restrict__ table) {
+    uint4* __restrict__ table, ANSNormalizeScratch<Threads>& scratch) {
     static_assert(
         kNumSymbols == Threads || isEvenDivisor(kNumSymbols, uint32_t(Threads)),
         "");
@@ -192,7 +222,6 @@ __device__ void normalizeProbabilitiesFromHistogram(
         return;
     }
 
-    constexpr int kWarps = Threads / kWarpSize;
     uint32_t kProbWeight = 1 << probBits;
     auto tid = threadIdx.x;
     int warpId = tid / kWarpSize;
@@ -219,8 +248,7 @@ __device__ void normalizeProbabilitiesFromHistogram(
     }
 
     // Sum qProbSym across all threads
-    __shared__ int smemSum[kWarps];
-    qProbSum = blockSum<Threads>(warpId, laneId, qProbSum, smemSum);
+    qProbSum = blockSum<Threads>(warpId, laneId, qProbSum, scratch.sum);
 
     // In order to use radix sorting, and also in order to only sort a single
     // word, pack both the weight and index into a single integer
@@ -235,8 +263,7 @@ __device__ void normalizeProbabilitiesFromHistogram(
     // The sort assumes a blocked arrangement as input, which we don't have, but
     // this doesn't matter as we only care about the arrangement post-sort
     using Sort = cub::BlockRadixSort<uint32_t, Threads, kNumSymPerThread>;
-    __shared__ typename Sort::TempStorage smemSort;
-    Sort(smemSort).SortDescending(sortedPair);
+    Sort(scratch.sort).SortDescending(sortedPair);
 
     // The (prob, symbol) pair that each thread is considered to
     // hold is the following:
@@ -285,9 +312,9 @@ __device__ void normalizeProbabilitiesFromHistogram(
             }
 
             // We need to determine the remaining number of >1 values
-            // We reuse smemSum but there is a syncthreads in the sort above,
-            // and at the end of the loop below
-            qNumGt1s = blockSum<Threads>(warpId, laneId, qNumGt1s, smemSum);
+            // We reuse scratch.sum but there is a syncthreads in the sort
+            // above, and at the end of the loop below
+            qNumGt1s = blockSum<Threads>(warpId, laneId, qNumGt1s, scratch.sum);
             __syncthreads();  // FIXME: not needed?
 
             // subtract from smallest >1 values
@@ -313,11 +340,9 @@ __device__ void normalizeProbabilitiesFromHistogram(
     }
 
     // Recover the pre-sort order
-    __shared__ uint32_t smemPdf[kNumSymbols];
-
 #pragma unroll
     for (int i = 0; i < kNumSymPerThread; ++i) {
-        smemPdf[tidSymbol[i]] = qProb[i];
+        scratch.pdf[tidSymbol[i]] = qProb[i];
     }
 
     __syncthreads();
@@ -329,15 +354,14 @@ __device__ void normalizeProbabilitiesFromHistogram(
 #pragma unroll
     for (int i = 0; i < kNumSymPerThread; ++i) {
         int curSym = tid * kNumSymPerThread + i;
-        symPdf[i] = smemPdf[curSym];
+        symPdf[i] = scratch.pdf[curSym];
     }
 
     using Scan = cub::BlockScan<uint32_t, Threads>;
-    __shared__ typename Scan::TempStorage smemScan;
 
     // FIXME: initialize to 0?
     uint32_t symCdf[kNumSymPerThread];
-    Scan(smemScan).ExclusiveSum(symPdf, symCdf);
+    Scan(scratch.scan).ExclusiveSum(symPdf, symCdf);
 
     // Compute divisor information (constant division via integer
     // multiplication + shift)
@@ -365,6 +389,16 @@ __device__ void normalizeProbabilitiesFromHistogram(
     }
 }
 
+template <int Threads>
+__device__ void normalizeProbabilitiesFromHistogram(
+    const uint32_t* __restrict__ counts, uint32_t totalNum, int probBits,
+    uint4* __restrict__ table) {
+    __shared__ ANSNormalizeScratch<Threads> scratch;
+
+    normalizeProbabilitiesFromHistogram<Threads>(counts, totalNum, probBits,
+                                                 table, scratch);
+}
+
 template <typename SizeProvider, int Threads>
 __global__ void quantizeWeights(const uint32_t* __restrict__ counts,
                                 SizeProvider sizeProvider, int probBits,
@@ -389,10 +423,8 @@ void ansHistogramBatch(uint32_t numInBatch, InProvider inProvider,
         constexpr uint32_t kThreads = kNumSymbols;
 
         // What is the maximum number of blocks to saturate the GPU?
-        int maxBlocks = 0;
-        CUDA_VERIFY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxBlocks, histogramBatch<InProvider, kThreads>, kThreads, 0));
-        maxBlocks *= getCurrentDeviceProperties().multiProcessorCount;
+        int maxBlocks = getMaxResidentBlocks(
+            histogramBatch<InProvider, kThreads>, kThreads);
 
         // The y block dimension will be for each batch element
         uint32_t xBlocks = divUp(maxBlocks, numInBatch);

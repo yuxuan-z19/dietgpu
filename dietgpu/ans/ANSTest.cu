@@ -78,9 +78,10 @@ std::vector<std::vector<uint8_t>> genBatch(const std::vector<uint32_t>& sizes,
     return out;
 }
 
-void runBatchPointer(StackDeviceMemory& res, int prec,
-                     const std::vector<uint32_t>& batchSizes,
-                     double lambda = 100.0) {
+std::vector<uint32_t> runBatchPointer(StackDeviceMemory& res, int prec,
+                                      const std::vector<uint32_t>& batchSizes,
+                                      double lambda = 100.0,
+                                      bool singleKernel = false) {
     // run on a different stream to test stream assignment
     auto stream = CudaStream::makeNonBlocking();
 
@@ -111,8 +112,8 @@ void runBatchPointer(StackDeviceMemory& res, int prec,
 
     auto outCompressedSize_dev = res.alloc<uint32_t>(stream, numInBatch);
 
-    ansEncodeBatchPointer(res, ANSCodecConfig(prec, true), numInBatch,
-                          inPtrs.data(), batchSizes.data(), nullptr,
+    ansEncodeBatchPointer(res, ANSCodecConfig(prec, true, singleKernel),
+                          numInBatch, inPtrs.data(), batchSizes.data(), nullptr,
                           encPtrs.data(), outCompressedSize_dev.data(), stream);
 
     auto encSize = outCompressedSize_dev.copyToHost(stream);
@@ -148,6 +149,8 @@ void runBatchPointer(StackDeviceMemory& res, int prec,
 
     auto dec_host = toHost(res, dec_dev, stream);
     EXPECT_EQ(batch_host, dec_host);
+
+    return encSize;
 }
 
 void runBatchStride(StackDeviceMemory& res, int prec, int numInBatch,
@@ -242,4 +245,50 @@ TEST(ANSTest, BatchStride) {
 
     // FIXME: 16 byte alignment required
     runBatchStride(res, 10, 13, 8192 + 16);
+}
+
+TEST(ANSTest, SingleKernel) {
+    auto res = makeStackMemory();
+
+    const int prec = kANSDefaultProbBits;
+
+    // The cooperative path differs from the multi-launch one in ways only
+    // certain shapes exercise: a member with no blocks still needs a header, a
+    // sub-block member takes the partial-block branch while an exact multiple
+    // of the 4 KiB block does not, and anything large makes the encode phase
+    // loop over blocks grid-stride instead of one warp owning one block.
+    auto batchSets = std::vector<std::vector<uint32_t>>{
+        {0},
+        {1},
+        {4095},
+        {4096},
+        {4097},
+        {1000, 4096, 100000, 1},
+        {1 << 20, 1 << 20},
+        {1 << 22},
+        // More blocks than the co-resident grid has warps, so the encode phase
+        // has to loop grid-stride instead of one warp owning one block. 24 MiB
+        // is 6144 blocks against a grid of at most a few thousand warps.
+        {24 << 20},
+    };
+
+    // More members than any device can keep co-resident, so the cooperative
+    // launch would be rejected: this has to fall back to the multi-launch path
+    // and still produce a correct archive, not fail.
+    batchSets.push_back(std::vector<uint32_t>(1024, 512));
+
+    for (auto& sizes : batchSets) {
+        for (auto lambda : {1.0, 100.0}) {
+            auto single = runBatchPointer(res, prec, sizes, lambda, true);
+            auto multi = runBatchPointer(res, prec, sizes, lambda, false);
+
+            // The two paths must agree on every member's compressed size. Their
+            // byte layouts need not match -- each block reserves its home from
+            // a shared tail, so blocks land in warp completion order -- but the
+            // histogram is an exact integer sum and the normalization is the
+            // same function at the same thread count, so the per-block lengths,
+            // and therefore the totals, are identical.
+            EXPECT_EQ(single, multi);
+        }
+    }
 }

@@ -58,7 +58,26 @@ void floatCompress(StackDeviceMemory& res, const FloatCompressConfig& config,
         maxSize = std::max(maxSize, inSize[i]);
     }
 
-    // Copy data to device
+    // If the batch size is <= kBSLimit, we avoid cudaMemcpy and send all data
+    // at kernel launch. ansEncodeBatchPointer and ansDecodeBatchPointer already
+    // do this; float compression was the last entry point still copying, and
+    // the copy is from *pageable* host memory, so the runtime stages it rather
+    // than just enqueueing it.
+    constexpr int kBSLimit = 128;
+
+    if (numInBatch <= kBSLimit) {
+        auto inProvider = BatchProviderInlinePointerCapacity<kBSLimit>(
+            numInBatch, (void**)in, inSize);
+        auto outProvider =
+            BatchProviderInlinePointer<kBSLimit>(numInBatch, out);
+
+        floatCompressDevice(res, config, numInBatch, inProvider, maxSize,
+                            outProvider, outSize_dev, stream);
+
+        return;
+    }
+
+    // Otherwise, copy data to device
     // To reduce latency, we prefer to coalesce all data together and copy as
     // one contiguous chunk
     static_assert(sizeof(void*) == sizeof(uintptr_t), "");

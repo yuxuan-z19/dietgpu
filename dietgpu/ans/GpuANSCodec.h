@@ -26,10 +26,13 @@ uint32_t getMaxCompressedSize(uint32_t uncompressedBytes);
 
 struct ANSCodecConfig {
     inline ANSCodecConfig()
-        : probBits(kANSDefaultProbBits), useChecksum(false) {}
+        : probBits(kANSDefaultProbBits),
+          useChecksum(false),
+          useSingleKernel(false) {}
 
-    explicit inline ANSCodecConfig(int pb, bool checksum = false)
-        : probBits(pb), useChecksum(checksum) {}
+    explicit inline ANSCodecConfig(int pb, bool checksum = false,
+                                   bool singleKernel = false)
+        : probBits(pb), useChecksum(checksum), useSingleKernel(singleKernel) {}
 
     // What the ANS probability accuracy is; all symbols have quantized
     // probabilities of 1/2^probBits (at 10, every symbol probability is one of
@@ -49,6 +52,32 @@ struct ANSCodecConfig {
     // optional feature useful if DietGPU data will be stored persistently on
     // disk.
     bool useChecksum;
+
+    // Compress in one cooperative kernel launch instead of the default three
+    // (histogram, normalize, encode+place).
+    //
+    // Off by default, and not a strict improvement. Measured on an RTX 4090
+    // with one batch member: 11-14% faster up to 16 MiB, where the default path
+    // spends more time submitting launches than the GPU spends working, and
+    // about 8% slower at 64 MiB. Compressed sizes come out identical either
+    // way.
+    //
+    // What remains of the cost is intrinsic to fusing rather than fixable. The
+    // histogram must be complete before anything normalizes it, so there is a
+    // real grid barrier there -- measured at ~2.0 us each on a 768 CTA grid,
+    // and this path needs two. And a cooperative launch has to be fully
+    // co-resident, so the grid is capped by the device instead of sized to the
+    // work, and while it runs nothing else can use the device. Occupancy itself
+    // is no longer part of the cost: the phases' shared memory is overlaid,
+    // since grid.sync() separates them, and __launch_bounds__ brings registers
+    // down without spilling -- see kCoopMinBlocksPerSM.
+    //
+    // Served for both the raw byte path and the float codec, by two kernels
+    // that share the encode and archive-writing phases. Requests that cannot be
+    // served cooperatively at all -- a caller-supplied histogram, or more batch
+    // members than the device can keep resident -- fall back to the default
+    // path and warn once, rather than failing.
+    bool useSingleKernel;
 };
 
 enum class ANSDecodeError : uint32_t {

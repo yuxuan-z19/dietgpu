@@ -243,7 +243,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
     bool compressAsFloat, StackDeviceMemory& res,
     const std::vector<torch::Tensor>& tIns, bool checksum,
     const std::optional<torch::Tensor>& outCompressed,
-    const std::optional<torch::Tensor>& outCompressedSizes) {
+    const std::optional<torch::Tensor>& outCompressedSizes, bool singleKernel) {
     TORCH_CHECK(!tIns.empty());
 
     // All computation will take place on this device
@@ -300,7 +300,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
     if (compressAsFloat) {
         auto config = FloatCompressConfig(
             getFloatTypeFromTensor(tIns[0]),
-            ANSCodecConfig(kDefaultPrecision, false),
+            ANSCodecConfig(kDefaultPrecision, false, singleKernel),
             false /* we'll figure this out later */, checksum);
 
         floatCompress(res, config, tIns.size(), inPtrs.data(), inSize.data(),
@@ -309,7 +309,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
                       (uint32_t*)sizes.data_ptr(),
                       at::cuda::getCurrentCUDAStream());
     } else {
-        auto config = ANSCodecConfig(kDefaultPrecision, checksum);
+        auto config = ANSCodecConfig(kDefaultPrecision, checksum, singleKernel);
 
         ansEncodeBatchPointer(res, config, tIns.size(), inPtrs.data(),
                               inSize.data(), nullptr, compPtrs.data(),
@@ -327,7 +327,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data(
     bool compressAsFloat, const std::vector<torch::Tensor>& tIns, bool checksum,
     const std::optional<torch::Tensor>& tempMem,
     const std::optional<torch::Tensor>& outCompressed,
-    const std::optional<torch::Tensor>& outCompressedSizes) {
+    const std::optional<torch::Tensor>& outCompressedSizes, bool singleKernel) {
     TORCH_CHECK(!tIns.empty());
 
     // All computation will take place on this device; set before creating the
@@ -340,16 +340,16 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data(
 
     // The rest of the validation takes place here
     return compress_data_res(compressAsFloat, res, tIns, checksum,
-                             outCompressed, outCompressedSizes);
+                             outCompressed, outCompressedSizes, singleKernel);
 }
 
 std::tuple<std::vector<torch::Tensor>, torch::Tensor, int64_t>
-compress_data_split_size(
-    bool compressAsFloat, const torch::Tensor& tIn,
-    const torch::Tensor& tSplitSizes, bool checksum,
-    const std::optional<torch::Tensor>& tempMem,
-    const std::optional<torch::Tensor>& outCompressed,
-    const std::optional<torch::Tensor>& outCompressedSizes) {
+compress_data_split_size(bool compressAsFloat, const torch::Tensor& tIn,
+                         const torch::Tensor& tSplitSizes, bool checksum,
+                         const std::optional<torch::Tensor>& tempMem,
+                         const std::optional<torch::Tensor>& outCompressed,
+                         const std::optional<torch::Tensor>& outCompressedSizes,
+                         bool singleKernel) {
     // All computation will take place on this device; set before creating the
     // GpuResources object
     int dev = tIn.get_device();
@@ -369,10 +369,14 @@ compress_data_split_size(
     if (compressAsFloat) {
         TORCH_CHECK(floatType != FloatType::kUndefined);
     } else {
-        // All input data must meet ANS alignment
+        // All input data must meet ANS alignment. The number is taken from the
+        // constant instead of spelled out: the message used to claim a 16 byte
+        // boundary while the check has always been kANSRequiredAlignment, which
+        // points anyone who hits it at the wrong alignment.
         TORCH_CHECK(uintptr_t(tIn.data_ptr()) % kANSRequiredAlignment == 0,
-                    "All splits should start on a 16 byte boundary; "
-                    "start pointer is not aligned");
+                    "All splits should start on a ", kANSRequiredAlignment,
+                    " byte boundary; start pointer ", tIn.data_ptr(),
+                    " is not aligned");
     }
 
     // Validate split sizes
@@ -391,9 +395,10 @@ compress_data_split_size(
             // All input data starts for direct ANS compression must meet ANS
             // alignment
             TORCH_CHECK(size % kANSRequiredAlignment == 0,
-                        "All splits should start on a 16 byte boundary; the "
-                        "size of an interior "
-                        "split is not a multiple of 16 bytes");
+                        "All splits should start on a ", kANSRequiredAlignment,
+                        " byte boundary; the size of interior split ", i, " (",
+                        size, ") is not a multiple of ", kANSRequiredAlignment,
+                        " bytes");
         }
     }
 
@@ -411,7 +416,7 @@ compress_data_split_size(
 
     if (compressAsFloat) {
         auto config = FloatCompressConfig(
-            floatType, ANSCodecConfig(kDefaultPrecision, false),
+            floatType, ANSCodecConfig(kDefaultPrecision, false, singleKernel),
             false /* we'll figure this out later */, checksum);
 
         floatCompressSplitSize(res, config, numInBatch, tIn.data_ptr(),
@@ -421,7 +426,7 @@ compress_data_split_size(
                                // FIXME: int32_t versus uint32_t
                                (uint32_t*)sizes.data_ptr(), stream);
     } else {
-        auto config = ANSCodecConfig(kDefaultPrecision, checksum);
+        auto config = ANSCodecConfig(kDefaultPrecision, checksum, singleKernel);
 
         ansEncodeBatchSplitSize(res, config, numInBatch, tIn.data_ptr(),
                                 // FIXME: int32_t versus uint32_t
@@ -440,7 +445,7 @@ compress_data_split_size(
 
 std::vector<torch::Tensor> compress_data_simple(
     bool compressAsFloat, const std::vector<torch::Tensor>& tIns, bool checksum,
-    const std::optional<int64_t>& tempMem) {
+    const std::optional<int64_t>& tempMem, bool singleKernel) {
     TORCH_CHECK(!tIns.empty());
 
     std::tuple<torch::Tensor, torch::Tensor, int64_t> comp;
@@ -453,11 +458,11 @@ std::vector<torch::Tensor> compress_data_simple(
 
         // rest of validation takes place here
         comp = compress_data(compressAsFloat, tIns, checksum, scratch,
-                             std::nullopt, std::nullopt);
+                             std::nullopt, std::nullopt, singleKernel);
     } else {
         // rest of validation takes place here
         comp = compress_data(compressAsFloat, tIns, checksum, std::nullopt,
-                             std::nullopt, std::nullopt);
+                             std::nullopt, std::nullopt, singleKernel);
     }
 
     auto& compMatrix_dev = std::get<0>(comp);
@@ -808,15 +813,17 @@ TORCH_LIBRARY_FRAGMENT(dietgpu, m) {
     m.def(
         "compress_data(bool compress_as_float, Tensor[] ts_in, bool "
         "checksum=False, Tensor? temp_mem=None, Tensor? out_compressed=None, "
-        "Tensor? out_compressed_bytes=None) -> (Tensor, Tensor, int)");
+        "Tensor? out_compressed_bytes=None, bool single_kernel=False) -> "
+        "(Tensor, Tensor, int)");
     m.def(
         "compress_data_split_size(bool compress_as_float, Tensor t_in, Tensor "
         "t_in_split_sizes, bool checksum=False, Tensor? temp_mem=None, Tensor? "
-        "out_compressed=None, Tensor? out_compressed_bytes=None) -> (Tensor[], "
-        "Tensor, int)");
+        "out_compressed=None, Tensor? out_compressed_bytes=None, bool "
+        "single_kernel=False) -> (Tensor[], Tensor, int)");
     m.def(
         "compress_data_simple(bool compress_as_float, Tensor[] ts_in, bool "
-        "checksum=False, int? temp_mem=67108864) -> Tensor[]");
+        "checksum=False, int? temp_mem=67108864, bool single_kernel=False) -> "
+        "Tensor[]");
 
     // data decompress
     m.def(

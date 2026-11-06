@@ -147,7 +147,13 @@ void* StackDeviceMemory::Stack::getAlloc(size_t size, cudaStream_t stream,
         CHECK_LE(head_, end_);
     }
 
-    maxSeenSize_ = std::max(maxSeenSize_, stackMemUsed + overflowSize_);
+    // Report the high-water mark including this allocation. It used to be
+    // computed from stackMemUsed, i.e. the usage *before* this allocation,
+    // which under-reported by the size of whatever was live at the peak -- and
+    // a large short-lived reservation could be returned before anything else
+    // was allocated, hiding it entirely. Callers size their temp_mem from this
+    // number, so under-reporting is the unsafe direction.
+    maxSeenSize_ = std::max(maxSeenSize_, getStackSizeUsed() + overflowSize_);
 
     return out;
 }

@@ -194,7 +194,7 @@ def main():
     ]:
         test()
 
-    print("\nall uint8 checks passed")
+    print("\nall float checks passed")
 
 
 if __name__ == "__main__":

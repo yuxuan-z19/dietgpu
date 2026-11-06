@@ -65,12 +65,21 @@ struct FloatCodecConfig {
     // so ansConfig.useChecksum being true is an error.
     ANSCodecConfig ansConfig;
 
-    // Are all all float input pointers/offsets (compress) or output
-    // pointers/offsets (decompress) are aligned to 16 bytes?
+    // No longer consulted; kept so that existing callers constructing this
+    // struct still compile.
     //
-    // If so, we can accelerate the decompression. If not, the float addresses
-    // should be aligned to the floating point word size (e.g.,
-    // FloatType::kFloat16, all are assumed sizeof(float16) == 2 byte aligned)
+    // It used to select between a single-pass decompression and a two-pass one
+    // that staged the decoded exponents in a temporary the size of the whole
+    // output, on the theory that only 16 byte aligned outputs could be joined
+    // vectorially. The vectorized join is gone and the writer that replaces it
+    // is scalar, so decompression is single-pass at any alignment and the
+    // branch -- along with that temporary -- was removed.
+    //
+    // The alignment requirement that remains is the one this field's own
+    // comment used to state as an aside: output pointers must be aligned to the
+    // floating point word size (2 bytes for kFloat16 / kBFloat16, 4 for
+    // kFloat32). That is now checked in floatDecompress /
+    // floatDecompressSplitSize rather than assumed.
     bool is16ByteAligned;
 };
 

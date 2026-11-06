@@ -31,24 +31,19 @@ FloatDecompressStatus floatDecompress(StackDeviceMemory& res,
     // at kernel launch
     constexpr int kLimit = 128;
 
-    // Investigate all of the output pointers; are they 16 byte aligned? If so,
-    // we can do everything in a single pass
-    bool is16ByteAligned = true;
+    // Decoding is a single pass for any output alignment; see
+    // floatDecompressDevice. What the single-pass writer does require is that
+    // each output pointer be aligned to the float word size, because it stores
+    // one word at a time. That has always been the API's contract, but it was
+    // assumed rather than checked, and a violation would surface as a
+    // device-side misaligned access fault with nothing pointing back at this
+    // argument.
+    auto floatWordSize = getWordSizeFromFloatType(config.floatType);
+
     for (int i = 0; i < numInBatch; ++i) {
-        if (reinterpret_cast<uintptr_t>(out[i]) % 16 != 0) {
-            is16ByteAligned = false;
-            break;
-        }
-    }
-
-    auto updatedConfig = config;
-    updatedConfig.is16ByteAligned = is16ByteAligned;
-
-    // We need a max capacity estimate before proceeding, for temporary memory
-    // allocations
-    uint32_t maxCapacity = 0;
-    for (uint32_t i = 0; i < numInBatch; ++i) {
-        maxCapacity = std::max(maxCapacity, outCapacity[i]);
+        CHECK(isPointerAligned(out[i], floatWordSize))
+            << "float decompression output " << i << " (" << out[i]
+            << ") must be aligned to the float word size " << floatWordSize;
     }
 
     if (numInBatch <= kLimit) {
@@ -58,9 +53,9 @@ FloatDecompressStatus floatDecompress(StackDeviceMemory& res,
         auto outProvider = BatchProviderInlinePointerCapacity<kLimit>(
             numInBatch, out, outCapacity);
 
-        return floatDecompressDevice(res, updatedConfig, numInBatch, inProvider,
-                                     outProvider, maxCapacity, outSuccess_dev,
-                                     outSize_dev, stream);
+        return floatDecompressDevice(res, config, numInBatch, inProvider,
+                                     outProvider, outSuccess_dev, outSize_dev,
+                                     stream);
     }
 
     // Copy data to device
@@ -91,9 +86,9 @@ FloatDecompressStatus floatDecompress(StackDeviceMemory& res,
     auto inProvider = BatchProviderPointer((void**)in_dev);
     auto outProvider = BatchProviderPointer((void**)out_dev, outCapacity_dev);
 
-    return floatDecompressDevice(res, updatedConfig, numInBatch, inProvider,
-                                 outProvider, maxCapacity, outSuccess_dev,
-                                 outSize_dev, stream);
+    return floatDecompressDevice(res, config, numInBatch, inProvider,
+                                 outProvider, outSuccess_dev, outSize_dev,
+                                 stream);
 }
 
 FloatDecompressStatus floatDecompressSplitSize(
@@ -107,27 +102,22 @@ FloatDecompressStatus floatDecompressSplitSize(
     auto splitSizeHost = std::vector<uint32_t>(numInBatch * 2);
     auto splitSize = splitSizeHost.data();
     auto splitSizePrefix = splitSizeHost.data() + numInBatch;
-    uint32_t maxSplitSize = 0;
 
-    bool is16ByteAligned = isPointerAligned(out, 16);
+    // As in floatDecompress: the single-pass writer stores one float word at a
+    // time, so the base pointer has to be float word aligned. Interior splits
+    // cannot break that, since each member starts at splitSizePrefix[i]
+    // elements and so is a whole number of words past an aligned base -- which
+    // is also why the 16 byte interior split check that used to live here is
+    // gone.
+    CHECK(isPointerAligned(out, floatWordSize))
+        << "float decompression output (" << out
+        << ") must be aligned to the float word size " << floatWordSize;
 
     for (uint32_t i = 0; i < numInBatch; ++i) {
-        auto size = outSplitSizes[i];
-
-        // If we only have one tensor in the batch, we only care if the start
-        // pointer is 16 byte aligned.
-        // Otherwise, all sizes except for the final one must ensure that all
-        // splits give a 16 byte alignment.
-        if ((i != numInBatch - 1) && (size % (16 / floatWordSize) != 0)) {
-            is16ByteAligned = false;
-        }
-
-        splitSize[i] = size;
+        splitSize[i] = outSplitSizes[i];
         if (i > 0) {
             splitSizePrefix[i] = splitSizePrefix[i - 1] + splitSize[i - 1];
         }
-
-        maxSplitSize = std::max(size, maxSplitSize);
     }
 
     auto sizes_dev = res.copyAlloc<uint32_t>(stream, splitSizeHost);
@@ -135,17 +125,14 @@ FloatDecompressStatus floatDecompressSplitSize(
     // FIXME: combine with above for a single h2d copy
     auto in_dev = res.copyAlloc<void*>(stream, (void**)in, numInBatch);
 
-    auto updatedConfig = config;
-    updatedConfig.is16ByteAligned = is16ByteAligned;
-
     auto inProvider = BatchProviderPointer(in_dev.data());
 
     auto outProvider = BatchProviderSplitSize(
         out, sizes_dev.data(), sizes_dev.data() + numInBatch, floatWordSize);
 
-    return floatDecompressDevice(res, updatedConfig, numInBatch, inProvider,
-                                 outProvider, maxSplitSize, outSuccess_dev,
-                                 outSize_dev, stream);
+    return floatDecompressDevice(res, config, numInBatch, inProvider,
+                                 outProvider, outSuccess_dev, outSize_dev,
+                                 stream);
 }
 
 }  // namespace dietgpu

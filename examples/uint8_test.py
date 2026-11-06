@@ -277,15 +277,21 @@ def test_uint8_float8_payload():
     The float codec only knows float16 / bfloat16 / float32. Its gain comes from
     splitting each multi-byte word into a redundant high byte (ANS coded) plus raw
     low mantissa bytes, and a 1-byte word has nothing to split, so float8 has to go
-    through ``compress_as_float=False``. That path accepts a float8 tensor as-is and
-    consumes it as raw bytes; viewing to uint8 first gives a byte-identical archive.
+    through ``compress_as_float=False``. That path accepts a float8 tensor as-is
+    and consumes it as raw bytes, so feeding it the tensor and feeding it that
+    tensor's uint8 view are the same compression problem: both archives come out
+    the same size and decode to the same bytes.
+
+    They are not byte-identical to each other -- but neither are any two archives
+    of the same multi-block input, on either path. That is a property of the
+    encoder, not of float8; see "API design" in README.md.
 
     Two things to watch:
     * the archive decodes to a flat uint8 tensor, so restore the dtype with
       ``out.view(fp8_dtype)`` and the shape with ``out.view(shape)``;
-    * verify with a byte comparison, never ``torch.equal`` on the float8 view: NaN
-      compares unequal to itself, so a byte-exact round-trip of a payload holding
-      NaN would be reported as a failure.
+    * compare the *decoded payload* as bytes, never with ``torch.equal`` on the
+      float8 view: NaN compares unequal to itself, so a byte-exact round-trip of
+      a payload holding NaN would be reported as a failure.
     """
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
@@ -310,8 +316,14 @@ def test_uint8_float8_payload():
             pass
 
         comp = compress_one(t)
-        # Feeding the float8 tensor directly equals feeding its uint8 view
-        assert torch.equal(comp, compress_one(t.view(torch.uint8)))
+        comp_view = compress_one(t.view(torch.uint8))
+
+        # Feeding the float8 tensor directly is the same problem as feeding its
+        # uint8 view: same symbols, same per-block lengths, so the same archive
+        # size and the same decoded bytes. Compare those rather than the archive
+        # bytes themselves, which vary run to run (README.md, "API design").
+        assert comp.numel() == comp_view.numel()
+        assert torch.equal(decompress_one(comp), decompress_one(comp_view))
 
         out = decompress_one(comp)
         assert out.dtype == torch.uint8

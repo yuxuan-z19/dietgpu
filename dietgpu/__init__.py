@@ -11,10 +11,21 @@ on CUDA devices, supporting float16, bfloat16, float32, and arbitrary byte data.
 """
 
 import os
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
 from pathlib import Path
 
 import torch
 from torch import Tensor
+
+# Package version, read from the installed distribution metadata so that it is
+# spelled out in exactly one place (pyproject.toml). A source checkout that was
+# never installed has no metadata to read, which is not worth failing an import
+# over.
+try:
+    __version__ = _metadata_version("dietgpu")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 
 # Load the C++ library
@@ -139,6 +150,7 @@ def compress_data(
     temp_mem: Tensor | None = None,
     out_compressed: Tensor | None = None,
     out_compressed_bytes: Tensor | None = None,
+    single_kernel: bool = False,
 ) -> tuple[Tensor, Tensor, int]:
     """
     Compress a batch of tensors.
@@ -150,6 +162,12 @@ def compress_data(
         temp_mem: Optional temporary memory buffer (uint8 tensor on CUDA)
         out_compressed: Optional pre-allocated output buffer for compressed data
         out_compressed_bytes: Optional pre-allocated output buffer for compressed sizes
+        single_kernel: Compress in one cooperative kernel launch instead of the
+            default three (byte path) or four (float path). Faster for batch
+            members up to ~16 MiB, slower above that, and it holds the whole
+            device while running. Falls back with a one-time warning where a
+            cooperative launch is not possible. See "API design" in README.md
+            for the measurements and the trade-off.
 
     Returns:
         Tuple of:
@@ -171,6 +189,7 @@ def compress_data(
         temp_mem,
         out_compressed,
         out_compressed_bytes,
+        single_kernel,
     )
 
 
@@ -182,6 +201,7 @@ def compress_data_split_size(
     temp_mem: Tensor | None = None,
     out_compressed: Tensor | None = None,
     out_compressed_bytes: Tensor | None = None,
+    single_kernel: bool = False,
 ) -> tuple[list[Tensor], Tensor, int]:
     """
     Compress a single tensor by splitting it into multiple parts.
@@ -194,6 +214,8 @@ def compress_data_split_size(
         temp_mem: Optional temporary memory buffer (uint8 tensor on CUDA)
         out_compressed: Optional pre-allocated output buffer for compressed data
         out_compressed_bytes: Optional pre-allocated output buffer for compressed sizes
+        single_kernel: Single cooperative launch instead of the default several;
+            see :func:`compress_data` for when that helps and when it does not
 
     Returns:
         Tuple of:
@@ -217,6 +239,7 @@ def compress_data_split_size(
         temp_mem,
         out_compressed,
         out_compressed_bytes,
+        single_kernel,
     )
 
 
@@ -225,6 +248,7 @@ def compress_data_simple(
     ts_in: list[Tensor],
     checksum: bool = False,
     temp_mem: int = 67108864,
+    single_kernel: bool = False,
 ) -> list[Tensor]:
     """
     Simple compression API that returns individual compressed tensors.
@@ -234,6 +258,8 @@ def compress_data_simple(
         ts_in: List of input tensors to compress
         checksum: Whether to include checksum in compressed data
         temp_mem: Optional temporary memory size in bytes (default: 64MB)
+        single_kernel: Single cooperative launch instead of the default several;
+            see :func:`compress_data` for when that helps and when it does not
 
     Returns:
         List of 1D uint8 tensors, one per input tensor
@@ -246,7 +272,7 @@ def compress_data_simple(
         >>> compressed = dietgpu.compress_data_simple(True, tensors)
     """
     return torch.ops.dietgpu.compress_data_simple(
-        compress_as_float, ts_in, checksum, temp_mem
+        compress_as_float, ts_in, checksum, temp_mem, single_kernel
     )
 
 
@@ -379,6 +405,8 @@ def decompress_data_simple(
 # ============================================================================
 
 __all__ = [
+    # Package metadata
+    "__version__",
     # Compression functions
     "compress_data",
     "compress_data_simple",

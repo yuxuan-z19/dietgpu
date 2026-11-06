@@ -243,10 +243,9 @@ struct ANSDecodeWarpFullBlock {
 
 template <typename InProvider, typename OutProvider, int Threads, int ProbBits,
           int BlockSize>
-__global__ __launch_bounds__(128) void ansDecodeKernel(
-    InProvider inProvider, const TableT* __restrict__ table,
-    OutProvider outProvider, uint8_t* __restrict__ outSuccess,
-    uint32_t* __restrict__ outSize) {
+__global__ __launch_bounds__(Threads) void ansDecodeKernel(
+    InProvider inProvider, OutProvider outProvider,
+    uint8_t* __restrict__ outSuccess, uint32_t* __restrict__ outSize) {
     auto tid = threadIdx.x;
     auto batch = blockIdx.y;
 
@@ -286,26 +285,6 @@ __global__ __launch_bounds__(128) void ansDecodeKernel(
         return;
     }
 
-    // Initialize symbol, pdf, cdf tables
-    constexpr int kBuckets = 1 << ProbBits;
-    __shared__ TableT lookup[kBuckets];
-
-    {
-        uint4* lookup4 = (uint4*)lookup;
-        const uint4* table4 = (const uint4*)(table + batch * (1 << ProbBits));
-
-        static_assert(isEvenDivisor(kBuckets, Threads * 4), "");
-        for (int j = 0;
-             // loading by uint4 words
-             j < kBuckets / (Threads * (sizeof(uint4) / sizeof(TableT))); ++j) {
-            lookup4[j * Threads + tid] = table4[j * Threads + tid];
-        }
-    }
-
-    __syncthreads();
-
-    auto writer = outProvider.getWriter(batch);
-
     // warp id taking into account warps in the current block
     // do this so the compiler knows it is warp uniform
     int globalWarpId =
@@ -313,6 +292,121 @@ __global__ __launch_bounds__(128) void ansDecodeKernel(
 
     auto warpsPerGrid = gridDim.x * Threads / kWarpSize;
     int laneId = getLaneId();
+
+    // The grid is deliberately oversubscribed (~4x what the device can keep
+    // resident) to cover tail effects and uneven provisioning across the batch,
+    // so most CTAs have nothing to decode and can leave before building the
+    // lookup table below. The test has to be CTA uniform: warps within a CTA
+    // are consecutive and the decode loop steps by the whole grid, so the CTA
+    // has work iff its first warp does -- testing globalWarpId instead would
+    // return from some warps only and hang the rest on the __syncthreads()
+    // below.
+    uint32_t firstWarpInCTA = (blockIdx.x * Threads) / kWarpSize;
+
+    if (firstWarpInCTA >= numBlocks) {
+        return;
+    }
+
+    // Build the rANS decode table in smem straight from the archive's pdf.
+    //
+    // This used to be its own kernel, which expanded each archive's 256 symbol
+    // probabilities into a 1 << ProbBits bucket table in gmem that every CTA
+    // here then copied into smem. Deriving it in place removes that launch,
+    // that per-batch buffer and a 4 KiB gmem read per CTA; what it costs is
+    // redoing the expansion once per CTA rather than once per batch member,
+    // which is cheap next to decoding a 4 KiB block and runs concurrently
+    // across CTAs.
+    constexpr int kBuckets = 1 << ProbBits;
+    __shared__ TableT lookup[kBuckets];
+
+    {
+        // cub's array scan wants a contiguous blocked arrangement, so thread
+        // tid owns symbols tid * kSymPerThread + i
+        constexpr int kSymPerThread = kNumSymbols / Threads;
+        static_assert(kNumSymbols % Threads == 0, "");
+        static_assert(kSymPerThread >= 1, "");
+
+        auto probs = headerIn->getSymbolProbs();
+
+        uint32_t pdf[kSymPerThread];
+        uint32_t cdf[kSymPerThread];
+
+#pragma unroll
+        for (int i = 0; i < kSymPerThread; ++i) {
+            pdf[i] = probs[tid * kSymPerThread + i];
+        }
+
+        // Get the CDF from the PDF
+        using BlockScan = cub::BlockScan<uint32_t, Threads>;
+        __shared__ typename BlockScan::TempStorage tempStorage;
+
+        uint32_t total = 0;
+        BlockScan(tempStorage).ExclusiveSum(pdf, cdf, total);
+
+        // should be a power of 2
+        assert(uint32_t(1 << ProbBits) == total);
+
+        // Publish the CDF indexed by symbol, with a sentinel, so that any
+        // bucket can be mapped back to the symbol that owns it.
+        __shared__ uint32_t smemCdf[kNumSymbols + 1];
+
+#pragma unroll
+        for (int i = 0; i < kSymPerThread; ++i) {
+            smemCdf[tid * kSymPerThread + i] = cdf[i];
+        }
+
+        if (tid == 0) {
+            smemCdf[kNumSymbols] = 1 << ProbBits;
+        }
+
+        __syncthreads();
+
+        // Fill the bucket table with each thread owning its own run of buckets,
+        // rather than one warp walking the 256 symbols in turn. Bucket j
+        // belongs to the *largest* symbol s with smemCdf[s] <= j: taking the
+        // largest skips symbols whose pdf is zero, and for that s the pdf
+        // smemCdf[s + 1] - smemCdf[s] is necessarily non-zero, since otherwise
+        // s would not have been the largest.
+        //
+        // The searches are log2(kNumSymbols) deep and independent across
+        // threads, so the cost does not depend on how the probability mass is
+        // spread. Both alternatives do: a symbol-serial loop is long when the
+        // pdf is peaked, and one thread per symbol serializes an archive
+        // holding a single distinct value -- which is exactly what all-zero
+        // input produces.
+        constexpr int kBucketsPerThread = kBuckets / Threads;
+        static_assert(kBuckets % Threads == 0, "");
+
+#pragma unroll
+        for (int b = 0; b < kBucketsPerThread; ++b) {
+            uint32_t bucket = b * Threads + tid;
+
+            // largest lo in [0, kNumSymbols) with smemCdf[lo] <= bucket,
+            // maintaining the invariant smemCdf[lo] <= bucket < smemCdf[hi]
+            uint32_t lo = 0;
+            uint32_t hi = kNumSymbols;
+
+            while (hi - lo > 1) {
+                uint32_t mid = (lo + hi) / 2;
+
+                if (smemCdf[mid] <= bucket) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            auto symBegin = smemCdf[lo];
+            auto symPdf = smemCdf[lo + 1] - symBegin;
+
+            // within-bucket cdf is bucket - symBegin
+            lookup[bucket] = packDecodeLookup(lo, symPdf, bucket - symBegin);
+        }
+    }
+
+    __syncthreads();
+
+    auto writer = outProvider.getWriter(batch);
 
     for (int block = globalWarpId; block < numBlocks; block += warpsPerGrid) {
         // Load state
@@ -342,76 +436,6 @@ __global__ __launch_bounds__(128) void ansDecodeKernel(
     }
 }
 
-template <typename BatchProvider, int Threads>
-__global__ void ansDecodeTable(BatchProvider inProvider, uint32_t probBits,
-                               TableT* __restrict__ table) {
-    auto batch = blockIdx.x;
-    auto tid = threadIdx.x;
-    int warpId = tid / kWarpSize;
-    int laneId = getLaneId();
-
-    table += batch * (1 << probBits);
-    auto headerIn = (const ANSCoalescedHeader*)inProvider.getBatchStart(batch);
-
-    auto header = *headerIn;
-
-    // Is this an expected header?
-    header.checkMagicAndVersion();
-
-    // Is our probability resolution what we expected?
-    assert(header.getProbBits() == probBits);
-
-    if (header.getTotalUncompressedWords() == 0) {
-        // nothing to do; compressed empty array
-        return;
-    }
-
-    // Skip to pdf table
-    auto probs = headerIn->getSymbolProbs();
-
-    static_assert(Threads >= kNumSymbols, "");
-    uint32_t pdf = tid < kNumSymbols ? probs[tid] : 0;
-    uint32_t cdf = 0;
-
-    // Get the CDF from the PDF
-    using BlockScan = cub::BlockScan<uint32_t, Threads>;
-    __shared__ typename BlockScan::TempStorage tempStorage;
-
-    uint32_t total = 0;
-    // FIXME: don't use cub, we can write both the pdf and cdf to smem with a
-    // single syncthreads
-    BlockScan(tempStorage).ExclusiveSum(pdf, cdf, total);
-
-    uint32_t totalProb = 1 << probBits;
-    assert(totalProb == total);  // should be a power of 2
-
-    // Broadcast the pdf/cdf values
-    __shared__ uint2 smemPdfCdf[kNumSymbols];
-
-    if (tid < kNumSymbols) {
-        smemPdfCdf[tid] = uint2{pdf, cdf};
-    }
-
-    __syncthreads();
-
-    // Build the table for each pdf/cdf bucket
-    constexpr int kWarpsPerBlock = Threads / kWarpSize;
-
-    for (int i = warpId; i < kNumSymbols; i += kWarpsPerBlock) {
-        auto v = smemPdfCdf[i];
-
-        auto pdf = v.x;
-        auto begin = v.y;
-        auto end = begin + pdf;
-
-        for (int j = begin + laneId; j < end; j += kWarpSize) {
-            table[j] = packDecodeLookup(i,           // symbol
-                                        pdf,         // bucket pdf
-                                        j - begin);  // within-bucket cdf
-        }
-    }
-}
-
 template <typename InProvider, typename OutProvider>
 ANSDecodeStatus ansDecodeBatch(
     StackDeviceMemory& res, const ANSCodecConfig& config, uint32_t numInBatch,
@@ -424,18 +448,9 @@ ANSDecodeStatus ansDecodeBatch(
         << "this build of dietgpu only instantiates pdf precision "
         << kANSDefaultProbBits << "; see ANSCodecConfig::probBits";
 
-    auto table_dev =
-        res.alloc<TableT>(stream, numInBatch * (1 << config.probBits));
-
-    // Build the rANS decoding table from the compression header
-    {
-        constexpr int kThreads = 512;
-        ansDecodeTable<InProvider, kThreads>
-            <<<numInBatch, kThreads, 0, stream>>>(inProvider, config.probBits,
-                                                  table_dev.data());
-    }
-
-    // Perform decoding
+    // Perform decoding. The rANS lookup table is built in smem by the kernel
+    // itself from each archive's pdf, so there is no table buffer to allocate
+    // and no separate expansion launch ahead of this one.
     {
         // FIXME: We have no idea how large the decompression job is, as the
         // relevant information is on the device.
@@ -444,22 +459,17 @@ ANSDecodeStatus ansDecodeBatch(
         // there is more work. We aim for a grid >4x larger than what the device
         // can sustain, to help cover up tail effects and unequal provisioning
         // across the batch
-        constexpr int kThreads = 128;
-        auto& props = getCurrentDeviceProperties();
-        int maxBlocksPerSM = 0;
-        CUDA_VERIFY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxBlocksPerSM,
+        constexpr int kThreads = 256;
+        uint32_t maxGrid = getMaxResidentBlocks(
             ansDecodeKernel<InProvider, OutProvider, kThreads,
                             kANSDefaultProbBits, kDefaultBlockSize>,
-            kThreads, 0));
-        uint32_t maxGrid = maxBlocksPerSM * props.multiProcessorCount;
+            kThreads);
         uint32_t perBatchGrid = divUp(maxGrid, numInBatch) * 4;
         auto grid = dim3(perBatchGrid, numInBatch);
 
         ansDecodeKernel<InProvider, OutProvider, kThreads, kANSDefaultProbBits,
                         kDefaultBlockSize><<<grid, kThreads, 0, stream>>>(
-            inProvider, table_dev.data(), outProvider, outSuccess_dev,
-            outSize_dev);
+            inProvider, outProvider, outSuccess_dev, outSize_dev);
     }
 
     ANSDecodeStatus status;
